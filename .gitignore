@@ -1,0 +1,11 @@
+# Operating system files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Local credentials
+.env
+.env.*
+!.env.example
+
+# Add build-output rules after confirming the actual toolchain.
