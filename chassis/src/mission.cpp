@@ -49,6 +49,10 @@ void MissionController::enterState(MissionState next, uint32_t nowMs) {
   stateEnterMs_ = nowMs;
   frontStopStreak_ = 0;
   lastFrontMs_ = 0;
+  wallPrevErrValid_ = false;
+  wallPrevErrMm_ = 0;
+  wallLastUpdateMs_ = 0;
+  wallFilteredDErr_ = 0.0f;
 }
 
 void MissionController::startDriveDistanceMm(int16_t distMm, uint32_t nowMs) {
@@ -596,14 +600,40 @@ bool MissionController::stepExitToTop(uint32_t nowMs) {
     speed = static_cast<int16_t>(
         tp.slowPwm + (static_cast<int32_t>(tp.basePwm - tp.slowPwm) * rem) / span);
   }
+  const uint32_t elapsedMs = nowMs - stateEnterMs_;
+  if (elapsedMs < DRIVE_SOFT_START_MS && speed > DRIVE_SOFT_START_PWM) {
+    speed = static_cast<int16_t>(
+        DRIVE_SOFT_START_PWM +
+        (static_cast<int32_t>(speed - DRIVE_SOFT_START_PWM) * static_cast<int32_t>(elapsedMs)) /
+            static_cast<int32_t>(DRIVE_SOFT_START_MS));
+  }
 
-  // 只跟左侧连续外围栏 (85mm) + IMU 0° 航向锁直，无视右侧 6 条田垄开口变化
+  // 只跟左侧连续外围栏 (实测居中 70mm) PD 控距 + HWT101CT 0° 航向锁直，无视右侧 6 条田垄开口变化
   int16_t usTurn = 0;
   if (left.valid && left.filteredMm <= tp.sideWallMaxMm) {
     int16_t err = static_cast<int16_t>(left.filteredMm) - static_cast<int16_t>(params_.crossOuterWallMm);
-    if (abs(err) > tp.errDeadbandMm) {
-      usTurn = -static_cast<int16_t>(tp.kp * static_cast<float>(err));
+    if (abs(err) <= tp.errDeadbandMm) {
+      err = 0;
     }
+    if (left.lastUpdateMs != wallLastUpdateMs_) {
+      if (wallPrevErrValid_ && wallLastUpdateMs_ != 0 && left.lastUpdateMs > wallLastUpdateMs_) {
+        float dtSec = static_cast<float>(left.lastUpdateMs - wallLastUpdateMs_) * 0.001f;
+        if (dtSec >= 0.02f && dtSec <= 0.50f) {
+          float rawD = static_cast<float>(err - wallPrevErrMm_) / dtSec;
+          wallFilteredDErr_ = 0.5f * rawD + 0.5f * wallFilteredDErr_;
+        }
+      } else {
+        wallFilteredDErr_ = 0.0f;
+      }
+      wallPrevErrMm_ = err;
+      wallPrevErrValid_ = true;
+      wallLastUpdateMs_ = left.lastUpdateMs;
+    }
+    usTurn = -static_cast<int16_t>(tp.kp * static_cast<float>(err) + tp.kd * wallFilteredDErr_);
+    usTurn = constrain(usTurn, -45, 45);
+  } else {
+    wallPrevErrValid_ = false;
+    wallFilteredDErr_ = 0.0f;
   }
 
   int16_t yawTurn = 0;

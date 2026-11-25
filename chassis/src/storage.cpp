@@ -7,7 +7,7 @@ namespace {
 
 constexpr int kEepromAddr = 0;
 constexpr uint32_t kMagic = 0x4D475431UL;  // "MGT1"
-constexpr uint16_t kVersion = 5;
+constexpr uint16_t kVersion = 8;
 
 struct PersistedBlock {
   uint32_t magic;

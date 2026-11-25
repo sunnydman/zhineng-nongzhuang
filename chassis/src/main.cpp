@@ -16,6 +16,7 @@
 #include "imu_serial.h"
 #include "mission.h"
 #include "motor_driver.h"
+#include "openmv_serial.h"
 #include "servo_controller.h"
 #include "storage.h"
 #include "tracker.h"
@@ -27,7 +28,8 @@ namespace {
 MotorDriver gMotors;         // 四路直流电机驱动 + 四轮独立速度 PI 闭环
 UltrasonicArray gUltrasonics;// 四路 HC-SR04 超声波轮询 + 3 点中值滤波
 EncoderArray gEncoders;      // 四路霍尔正交编码器（PCINT2 4 倍频）
-ImuSerial gImu;              // Serial1 串口六轴 IMU（0x7E 0x23 协议）
+ImuSerial gImu;              // Serial1 串口陀螺仪（维特 HWT101CT-TTL / 备用雅博）
+OpenMvManager gOpenMv;       // Serial2 + Serial3 双路 OpenMV 接收器（MV1 协议 115200）
 CorridorTracker gTracker;    // 垄沟居中循迹 + IMU 锁直 + 端头防撞控制器
 MissionController gMission;  // 全程闭环与单步测试任务状态机
 ServoController gServos;     // 三路舵机控制器（D32 / D33 / D34，占用 Timer5）
@@ -125,7 +127,8 @@ void printHelp() {
   Serial.println(F("  RATE <10..100>       : Set IMU output frequency Hz (0x60)"));
   Serial.println(F("  BAUD <rate>          : Switch Serial1 baud rate online (e.g. 115200 or 9600)"));
   Serial.println(F("  W <target> <pwm> [ms]: Bench test motor (target: fl|rl|fr|rr|l|r|all)"));
-  Serial.println(F("  SV [32|33|34|all] <deg|test|off>: Test/move servos on D32/D33/D34 (e.g. SV, SV 32 90, SV OFF)"));
+  Serial.println(F("  SV [zero|off|test|ld|rd|lu|ru|32..35] [deg]: 4-servo zero(90), dir test & control"));
+  Serial.println(F("  MV / MVRAW / MVLOG   : Check OpenMV (Serial2/3) status / sniff raw bytes / toggle live log"));
   Serial.println(F("  SCALE <wheel> <val>  : Trim single wheel PWM scale (fl|rl|fr|rr, 0.50..1.30)"));
   Serial.println(F("  E / EC               : Print 4-wheel encoder counts/speed / Clear encoder counts"));
   Serial.println(F("  P                    : Print pinout, IMU status & parameters"));
@@ -193,9 +196,8 @@ void printConfigSummary() {
   Serial.println(F(" deg/s"));
 
   Serial.println(F("  Encoders (PCINT2 A8-A15): FL=A12/A13, RL=A8/A9, FR=A14/A15, RR=A10/A11"));
-  Serial.print(F("  Servos (Timer5): D")); Serial.print(PIN_SERVO_0);
-  Serial.print(F(", D")); Serial.print(PIN_SERVO_1);
-  Serial.print(F(", D")); Serial.println(PIN_SERVO_2);
+  gServos.printStatus();
+  gOpenMv.printSummary(nowMs);
 
   Serial.println(F("--- Tracker Params ---"));
   Serial.print(F("  kp=")); Serial.print(p.kp, 3);
@@ -656,12 +658,13 @@ void processCommandLine(char* line) {
     char* t3 = strtok(nullptr, " \t");
     handleWheelTest(t1, t2, t3);
   } else if (strcmp(tok0, "sv") == 0) {
-    // 舵机测试与角度控制：
-    //   SV                  -> 依次小幅摆动测试 D32 -> D33 -> D34 (90->65->115->90°)
-    //   SV TEST             -> 同上
-    //   SV OFF              -> 释放全部舵机 PWM（断力保护）
-    //   SV <32|33|34> TEST  -> 单独小幅摆动测试该舵机
-    //   SV <32|33|34|all> <0..180> -> 转到指定角度
+    // 四路击打舵机控制（LD=32左低, RD=33右低, LU=34左高, RU=35右高）：
+    //   SV HOME / SV IN           -> 四路错峰全部贴身收回 (LD=30, RD=150, LU=150, RU=30)
+    //   SV OUT <ld|rd|lu|ru|all>  -> 按标定方向外扩 110° 至击打位
+    //   SV HIT <ld|rd|lu|ru>      -> 单路快速外扩 110° 击打并自动收回
+    //   SV ZERO                   -> 四路错峰全归 90° 中位
+    //   SV OFF                    -> 断力释放全部 4 路 PWM
+    //   SV <ld|rd|lu|ru|32..35> <0..180> -> 转到指定角度
     char* t1 = strtok(nullptr, " \t");
     char* t2 = strtok(nullptr, " \t");
     if (t1 == nullptr) {
@@ -673,9 +676,62 @@ void processCommandLine(char* line) {
       gServos.startTestSweep(-1, nowMs);
       return;
     }
+    if (strcmp(t1, "home") == 0 || strcmp(t1, "in") == 0) {
+      if (t2 != nullptr) {
+        toLowerStr(t2);
+        int8_t idx = ServoController::resolveName(t2);
+        if (idx >= 0) {
+          gServos.retract(static_cast<uint8_t>(idx));
+          return;
+        }
+      }
+      gServos.retractAll(200);
+      Serial.println(F("[SERVO] 全部 4 路已贴身收回"));
+      return;
+    }
+    if (strcmp(t1, "out") == 0) {
+      if (t2 == nullptr) {
+        Serial.println(F("[ERR] Usage: SV OUT <ld|rd|lu|ru|all>"));
+        return;
+      }
+      toLowerStr(t2);
+      if (strcmp(t2, "all") == 0) {
+        for (uint8_t i = 0; i < SERVO_COUNT; ++i) {
+          gServos.extend(i);
+          if ((i + 1) < SERVO_COUNT) delay(200);
+        }
+        return;
+      }
+      int8_t idx = ServoController::resolveName(t2);
+      if (idx >= 0) {
+        gServos.extend(static_cast<uint8_t>(idx));
+      } else {
+        Serial.println(F("[ERR] Unknown servo. Use ld|rd|lu|ru|32..35|all"));
+      }
+      return;
+    }
+    if (strcmp(t1, "hit") == 0) {
+      if (t2 == nullptr) {
+        Serial.println(F("[ERR] Usage: SV HIT <ld|rd|lu|ru|32..35>"));
+        return;
+      }
+      toLowerStr(t2);
+      int8_t idx = ServoController::resolveName(t2);
+      if (idx >= 0) {
+        gServos.triggerStrike(static_cast<uint8_t>(idx), nowMs);
+      } else {
+        Serial.println(F("[ERR] Unknown servo. Use ld|rd|lu|ru|32..35"));
+      }
+      return;
+    }
+    if (strcmp(t1, "zero") == 0 || strcmp(t1, "center") == 0) {
+      gServos.setAllStaggered(SERVO_CENTER_DEG, 250);
+      Serial.println(F("[SERVO] 全部 4 路已错峰归中位 90°"));
+      return;
+    }
     if (strcmp(t1, "off") == 0 || strcmp(t1, "detach") == 0) {
       gServos.detachAll();
-      Serial.println(F("[SERVO] 已断开 D32/D33/D34 全部 PWM 信号（断力释放）"));
+      Serial.println(F("[SERVO] 已断开 LD(32)/RD(33)/LU(34)/RU(35) 全部 PWM 信号（断力释放）"));
       return;
     }
     if (strcmp(t1, "all") == 0) {
@@ -683,17 +739,13 @@ void processCommandLine(char* line) {
         gServos.startTestSweep(-1, nowMs);
       } else {
         uint8_t deg = static_cast<uint8_t>(constrain(atoi(t2), 0, 180));
-        gServos.stopTest();
-        gServos.setAll(deg);
-        Serial.print(F("[SERVO] D32/D33/D34 全部 -> "));
-        Serial.print(deg);
-        Serial.println(F(" deg"));
+        gServos.setAllStaggered(deg, 250);
       }
       return;
     }
-    int8_t idx = ServoController::resolveIndex(static_cast<int16_t>(atoi(t1)));
+    int8_t idx = ServoController::resolveName(t1);
     if (idx < 0) {
-      Serial.println(F("[ERR] Usage: SV | SV OFF | SV <32|33|34|all> <0..180|test>"));
+      Serial.println(F("[ERR] Usage: SV HOME | SV OUT <ch> | SV HIT <ch> | SV OFF | SV <ch> <deg>"));
       return;
     }
     if (t2 == nullptr) {
@@ -707,12 +759,24 @@ void processCommandLine(char* line) {
       uint8_t deg = static_cast<uint8_t>(constrain(atoi(t2), 0, 180));
       gServos.stopTest();
       gServos.setAngle(static_cast<uint8_t>(idx), deg);
-      Serial.print(F("[SERVO] D"));
-      Serial.print(ServoController::pinOf(static_cast<uint8_t>(idx)));
+      Serial.print(F("[SERVO] "));
+      Serial.print(ServoController::nameOf(static_cast<uint8_t>(idx)));
       Serial.print(F(" -> "));
       Serial.print(deg);
       Serial.println(F(" deg"));
     }
+  } else if (strcmp(tok0, "mv") == 0) {
+    gOpenMv.printSummary(nowMs);
+  } else if (strcmp(tok0, "mv1") == 0) {
+    gMission.abort();
+    gOpenMv.testOnSerial1(2000, gImu.baud());
+  } else if (strcmp(tok0, "mvraw") == 0) {
+    gMission.abort();
+    gOpenMv.dumpRawBoth(1500);
+  } else if (strcmp(tok0, "mvlog") == 0) {
+    gOpenMv.setStreamLog(!gOpenMv.streamLog());
+    Serial.print(F("[MV] 实时帧打印 "));
+    Serial.println(gOpenMv.streamLog() ? F("ON") : F("OFF"));
   } else if (strcmp(tok0, "scale") == 0) {
     char* t1 = strtok(nullptr, " \t");
     char* t2 = strtok(nullptr, " \t");
@@ -810,6 +874,7 @@ void setup() {
   gUltrasonics.begin();
   gEncoders.begin();
   gImu.begin(IMU_BAUD_RATE);
+  gOpenMv.begin(OPENMV_BAUD_RATE);
   gServos.begin();
   gTracker.begin(&gMotors, &gUltrasonics, &gImu);
   gMission.begin(&gMotors, &gUltrasonics, &gEncoders, &gImu, &gTracker);
@@ -830,6 +895,7 @@ void setup() {
   if (AUTO_START_MODE == 1) {
     armAutoLTest(AUTO_START_DELAY_MS, millis());
   } else if (AUTO_START_MODE == 2) {
+    gServos.retractAll(150);  // 发车前先将 4 根击打杆锁死在竖直贴身位，防碰田垄/树枝
     armFullMatch(AUTO_START_LANES, AUTO_START_DELAY_MS, millis());
   } else if (AUTO_START_MODE == 3) {
     gArmedCountdown = true;
@@ -838,6 +904,14 @@ void setup() {
     Serial.print(F("[ARM] Standalone Servo Loop Test on D"));
     Serial.print(AUTO_SERVO_TEST_PIN);
     Serial.println(F(" starting in 1.5s... (motors stay IDLE)"));
+  } else if (AUTO_START_MODE == 4) {
+    gServos.retractAll(150);  // 发车前先收拢 4 根击打杆至竖直贴身位
+    gArmedCountdown = true;
+    gLaunchMode = 4;
+    gLaunchAtMs = millis() + AUTO_START_DELAY_MS;
+    Serial.print(F("[ARM] Single-lane corridor tracking starting in "));
+    Serial.print(AUTO_START_DELAY_MS);
+    Serial.println(F(" ms... (send X/Space to cancel)"));
   } else {
     Serial.println(F("[BOOT] Motors IDLE. Send 'U' monitor, 'W' test wheels, 'LT' L-test, 'F' full match."));
   }
@@ -854,7 +928,7 @@ void loop() {
   // 2. 实体启动/急停按键检测
   pollStartButton(nowMs);
 
-  // 3. 倒计时到点后自动切入预约任务（1=L形测试，2=全程比赛，3=脱机舵机循环测试）
+  // 3. 倒计时到点后自动切入预约任务（1=L形测试，2=全程比赛，3=舵机循环，4=单垄居中循迹）
   if (gArmedCountdown && static_cast<int32_t>(nowMs - gLaunchAtMs) >= 0) {
     gArmedCountdown = false;
     if (gLaunchMode == 1) {
@@ -865,20 +939,28 @@ void loop() {
       if (idx >= 0) {
         gServos.startLoopTest(static_cast<uint8_t>(idx), nowMs);
       }
+    } else if (gLaunchMode == 4) {
+      if (gImu.isOnline(nowMs)) {
+        gImu.zeroYaw();
+      }
+      gTracker.startForward(nowMs);
+      Serial.println(F("[TRACK] 启动脱机单垄居中循迹（双超声居中 + HWT101CT 锁直，到端头停稳）"));
     } else {
       gMission.startFullMatch(gLaunchLanes, nowMs);
     }
   }
 
-  // 4. 超声测距前先排空 Serial1，避免 64B 硬件接收缓冲在 pulseIn 期间溢出
+  // 4. 超声测距前先排空 Serial1(陀螺仪) 与 Serial2/3(双 OpenMV)，防 64B 硬件接收缓冲溢出
   gImu.update(nowMs);
+  gOpenMv.update(nowMs);
 
-  // 5. 轮询 1 路超声波（每 25 ms 测 1 路，100 ms 完成 F->R->B->L 一轮）
+  // 5. 轮询 1 路超声波（每 28 ms 测 1 路，112 ms 完成 F->R->B->L 一轮）
   bool sampled = gUltrasonics.update(nowMs);
 
   nowMs = millis();
-  // 6. 超声测距后立刻再排空一次 Serial1，并按 50 ms 节拍更新编码器速度/里程
+  // 6. 超声测距后立刻再排空一次全部硬件串口，并按 50 ms 节拍更新编码器速度/里程
   gImu.update(nowMs);
+  gOpenMv.update(nowMs);
   gEncoders.update(nowMs);
 
   // 7. 若有新的超声采样（或处于手动限时测试），推进底盘循迹控制器

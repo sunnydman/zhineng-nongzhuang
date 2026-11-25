@@ -56,7 +56,7 @@ constexpr float MOTOR_FR_SCALE = 0.85f;
 constexpr float MOTOR_RR_SCALE = 1.00f;
 
 // 电机输出保护参数
-constexpr int16_t  MOTOR_PWM_MAX           = 240;  // PWM 输出上限（留足毛毯加力余量）
+constexpr int16_t  MOTOR_PWM_MAX           = 255;  // PWM 输出满幅上限（发挥 110RPM 电机全部余量）
 constexpr int16_t  MOTOR_PWM_MIN_EFFECTIVE = 35;   // 非零最小有效占空比，防止死区嗡鸣不转
 constexpr uint16_t MOTOR_DIR_DEADTIME_US   = 100;  // 换向前先拉低 EN 的保护死区 (us)，保护 L298N
 
@@ -89,10 +89,11 @@ constexpr uint8_t  US_STALE_LIMIT      = 3;      // 连续无效 3 次后清空�
 //    AUTO_START_MODE:
 //      0 = 上电待机（仅串口或 D2 按钮触发，插 USB 调参时用）
 //      1 = 上电倒计时后自动跑【直行 -> 90°转弯 -> 直行】测试（拔掉 USB 放地上即走）
-//      2 = 上电倒计时后自动跑【完整 7 垄比赛闭环】
+//      2 = 上电倒计时后自动跑【完整 7 垄比赛闭环】（自动先收拢 4 根击打杆）
 //      3 = 上电脱机循环测试舵机（底盘轮子全程停机，拔掉 USB 放心拿万用表调 6V 供电）
+//      4 = 上电倒计时后自动跑【单垄居中循迹，到端头停稳】（放进任意垄沟首测居中与停距）
 // ============================================================================
-constexpr uint8_t  AUTO_START_MODE      = 1;      // 当前设为 1：上电 3 秒后自动跑直线->90°转弯->直行测试 (HWT101CT 20Hz)
+constexpr uint8_t  AUTO_START_MODE      = 2;      // 模式 2：上电 3 秒后收拢四杆并跑完整 7 垄闭环（烧录前请先关 12V）
 constexpr uint16_t AUTO_START_DELAY_MS  = 3000;   // 上电发车倒计时 (ms)
 constexpr uint8_t  AUTO_START_LANES     = 7;      // 模式 2（全程比赛）遍历垄沟数（专本组为 7 条沟）
 constexpr uint8_t  AUTO_SERVO_TEST_PIN  = 33;     // 模式 3 自动循环测试的舵机引脚 (32 / 33 / 34)
@@ -111,20 +112,20 @@ constexpr uint16_t BTN_DEBOUNCE_MS     = 40;
 constexpr uint16_t BTN_START_DELAY_MS  = 1500;
 
 // ============================================================================
-// 4. 垄沟居中循迹参数（按 400mm 通道、320×310mm 车身、超声内缩 40mm 精确推算）
+// 4. 垄沟居中循迹参数（实测轮外沿距垄边 ~30mm -> 轮宽 ~340mm，超声内缩 ~41mm，实测居中 L=71mm）
 // ============================================================================
-constexpr int16_t  DEFAULT_BASE_PWM         = 180;    // 沟内正常巡航速度指令 (VelPID 下约 225 mm/s，提速 50%)
-constexpr int16_t  DEFAULT_SLOW_PWM         = 100;    // 接近端头或开阔区降速指令 (约 125 mm/s)
-constexpr uint16_t DRIVE_SOFT_START_MS      = 320;    // 起步软加速斜坡时长 (ms)，防止四轮静摩擦差导致起步歪
+constexpr int16_t  DEFAULT_BASE_PWM         = 165;    // 稳妥慢速巡航指令 (VelPID 下约 194 mm/s ≈ 0.19 m/s，极稳不偏)
+constexpr int16_t  DEFAULT_SLOW_PWM         = 95;     // 接近端头或开阔区降速指令 (约 112 mm/s)
+constexpr uint16_t DRIVE_SOFT_START_MS      = 320;    // 起步软加速斜坡时长 (ms)
 constexpr int16_t  DRIVE_SOFT_START_PWM     = 55;     // 起步斜坡起始速度指令 (PWM)
-constexpr uint16_t DEFAULT_FRONT_SLOW_MM    = 320;    // 前超声 <320mm (物理净空 280mm) 开始平滑减速
-constexpr uint16_t DEFAULT_FRONT_STOP_MM    = 140;    // 前超声 <=140mm (物理净空 100mm, 车心距墙 260mm) 停稳起弯
-constexpr uint16_t DEFAULT_REAR_STOP_MM     = 130;    // 倒车后超声 <=130mm (物理净空 90mm, 车心距左围栏 250mm) 停稳回库
-constexpr uint16_t DEFAULT_SIDE_WALL_MAX_MM = 220;    // 居中 85mm、贴对侧墙约 130mm；>220mm 判定该侧开阔无墙
-constexpr uint16_t DEFAULT_SINGLE_WALL_MM   = 85;     // 单侧跟墙目标读数：(400-310)/2 + 40 = 85 mm
-constexpr int16_t  DEFAULT_ERR_DEADBAND_MM  = 6;      // 横向居中死区 (±6mm)，抑制超声小抖动
-constexpr float    DEFAULT_KP_CENTER        = 0.50f;  // 侧向超声居中比例 (PWM / mm)，画龙则调小
-constexpr float    DEFAULT_KD_CENTER        = 0.14f;  // 侧向超声居中微分阻尼，抑制摆动
+constexpr uint16_t DEFAULT_FRONT_SLOW_MM    = 320;    // 前超声 <320mm 开始平滑减速
+constexpr uint16_t DEFAULT_FRONT_STOP_MM    = 145;    // 前超声 <=145mm (物理净空 ~105mm, 适配 340mm 轮宽弧线过弯)
+constexpr uint16_t DEFAULT_REAR_STOP_MM     = 135;    // 倒车后超声 <=135mm (物理净空 ~95mm, 车心距左围栏 ~255mm)
+constexpr uint16_t DEFAULT_SIDE_WALL_MAX_MM = 220;    // 居中 ~71mm、贴对侧墙 ~101mm；>220mm 判定该侧开阔无墙
+constexpr uint16_t DEFAULT_SINGLE_WALL_MM   = 70;     // 实测 400mm 通道居中单侧超声目标：70 mm (左右轮各留 30mm 余量)
+constexpr int16_t  DEFAULT_ERR_DEADBAND_MM  = 5;      // 横向居中死区 (±5mm)
+constexpr float    DEFAULT_KP_CENTER        = 0.60f;  // 侧向超声控距比例 (PWM / mm)，加强贴墙控距响应
+constexpr float    DEFAULT_KD_CENTER        = 0.16f;  // 侧向超声控距微分阻尼，防画龙
 constexpr int16_t  DEFAULT_MAX_STEER_PWM    = 70;     // 差速纠偏最大输出限幅
 constexpr uint8_t  END_STOP_CONFIRM_COUNT   = 2;      // 端头停车需连续 2 帧超声确认，防单帧杂波误停
 constexpr uint16_t LANE_END_GUARD_MS        = 400;    // 刚进入新沟前 400ms 屏蔽端头停车，防止入口误触发
@@ -157,24 +158,24 @@ constexpr bool     IMU_EULER_IS_RADIANS     = true;
 constexpr uint16_t IMU_ONLINE_TIMEOUT_MS    = 500;    // 超过 500ms 无有效偏航帧则判定离线
 // 方向约定：车头逆时针(向左)转 90° 时 yaw 应增大到 +90°；烧录后实测若显示 -90° 则改为 true
 constexpr bool     IMU_YAW_INVERT           = false;
-constexpr float    DEFAULT_KP_YAW_HOLD      = 3.20f;  // 直行航向锁直比例 (PWM / deg)，提高起步及直线抗偏能力
+constexpr float    DEFAULT_KP_YAW_HOLD      = 3.00f;  // 直行航向锁直比例 (PWM / deg)，与单侧超声控距平衡配合
 
 // ============================================================================
 // 6. 端头 90° 弧线过弯、跨垄换沟与全程回库参数
 //    针对 320×310mm（对角线 445.5mm > 400mm）设计前/后偏置弧线过弯，清障余量 >32mm
 // ============================================================================
-constexpr int16_t  DEFAULT_TURN_MAX_PWM        = 125;   // 90° 转向最大差速指令（减小旋转惯量，毛毯转不动可加大）
+constexpr int16_t  DEFAULT_TURN_MAX_PWM        = 125;   // 90° 转向最大差速指令（稳妥慢转，防惯性过冲）
 constexpr int16_t  DEFAULT_TURN_MIN_PWM        = 65;    // 接近目标角时的最小起转指令
 constexpr float    DEFAULT_TURN_KP             = 1.85f; // 陀螺仪闭环转向比例 (PWM / deg)，过冲则调小
-constexpr float    DEFAULT_TURN_KD             = 0.22f; // 陀螺仪 Z 轴角速度阻尼 (PWM / (deg/s))，提前刹车防转过头
-constexpr float    DEFAULT_TURN_ARC_RATIO      = 0.35f; // 弧线偏置比 (0=纯原地转；0.35 适配 320×310 避障过弯)
+constexpr float    DEFAULT_TURN_KD             = 0.24f; // 陀螺仪 Z 轴角速度阻尼 (PWM / (deg/s))，提前刹车防转过头
+constexpr float    DEFAULT_TURN_ARC_RATIO      = 0.38f; // 弧线偏置比 (适配 320×340 含轮外包络在 400mm 拐角无碰过弯)
 constexpr float    DEFAULT_TURN_TOL_DEG        = 2.0f;  // 转向到位判定容差 (±deg)
-constexpr uint16_t DEFAULT_TURN_HOLD_MS        = 120;   // 进入容差后稳停确认时间 (ms)
+constexpr uint16_t DEFAULT_TURN_HOLD_MS        = 120;   // 进入容差后短刹稳停确认时间 (ms)
 constexpr uint16_t DEFAULT_TURN_FALLBACK_90_MS = 720;   // IMU 离线时的定时 90° 回退时长 (ms)
 constexpr uint16_t DEFAULT_TURN_TIMEOUT_MS     = 3800;  // 单次转向最大超时保护 (ms)
 
-constexpr int16_t  DEFAULT_CROSS_PWM           = 130;   // 沿端头通道跨垄速度指令 (约 162 mm/s)
-constexpr uint16_t DEFAULT_CROSS_OUTER_WALL_MM = 85;    // 跨垄时外侧超声贴外围栏目标 (400mm 通道居中 = 85mm)
+constexpr int16_t  DEFAULT_CROSS_PWM           = 115;   // 沿端头通道跨垄速度指令 (约 135 mm/s，稳妥过垄)
+constexpr uint16_t DEFAULT_CROSS_OUTER_WALL_MM = 70;    // 实测 400mm 通道居中外侧超声贴墙目标：70 mm (实测 L=71mm)
 constexpr uint16_t DEFAULT_CROSS_RIDGE_MAX_MM  = 420;   // 内侧超声识别垄端面阈值 (普通垄~85mm, 短垄R4~285mm)
 constexpr uint16_t DEFAULT_CROSS_OPEN_MIN_MM   = 550;   // 内侧超声判定离开垄端面、到达新沟口阈值 (>550mm 或 ---)
 constexpr uint8_t  DEFAULT_CROSS_DEBOUNCE_CNT  = 2;     // 边沿跳变连续确认次数，防单帧误触发
@@ -183,7 +184,7 @@ constexpr uint16_t DEFAULT_CROSS_CENTER_MM     = 140;   // 扫过垄端面后编
 constexpr uint16_t DEFAULT_CROSS_MAX_DIST_MM   = 680;   // 跨垄编码器最大里程兜底 (两沟中心距 700mm，防漏扫冲过头)
 constexpr uint16_t DEFAULT_CROSS_CENTER_MS     = 1500;  // 过垄对中微进超时保护 (ms)
 constexpr uint16_t DEFAULT_CROSS_MAX_MS        = 5000;  // 跨垄总超时保护 (ms)
-constexpr uint16_t DEFAULT_SETTLE_MS           = 200;   // 动作切换间短停等待超声清空刷新的时间 (ms)
+constexpr uint16_t DEFAULT_SETTLE_MS           = 160;   // 动作切换间短停等待超声清空刷新的时间 (ms)
 constexpr uint16_t DEFAULT_EXIT_MAX_MS         = 25000; // 出启动区沿左通道直冲顶围栏 (4.6m) 最大超时保护 (ms)
 constexpr uint16_t DEFAULT_HOME_DIST_MM        = 650;   // 对准入口后编码器直行 650mm，将 320mm 车体完整停入 1000mm 启动区
 constexpr uint16_t DEFAULT_HOME_DRIVE_MS       = 6500;  // 回启动区行驶最大超时保护 (ms)
@@ -202,23 +203,53 @@ constexpr uint16_t ENCODER_SAMPLE_MS    = 50;       // 测速与速度闭环周�
 
 // 四轮独立速度 PI 闭环（已实测四轮同步误差 < ±1.9%，自动抗毛毯和电池压降）
 constexpr bool     DEFAULT_VEL_PID_ENABLED = true;
-constexpr float    DEFAULT_WHEEL_MAX_MMS   = 300.0f;  // 指令满幅 (MOTOR_PWM_MAX) 对应的目标轮速 (mm/s)
+constexpr float    DEFAULT_WHEEL_MAX_MMS   = 300.0f;  // 指令满幅 (255) 对应的目标轮速 (mm/s，稳妥不饱和)
 constexpr float    DEFAULT_VEL_KP          = 0.32f;   // 速度环比例系数 (加快起步同步响应)
 constexpr float    DEFAULT_VEL_KI          = 0.65f;   // 速度环积分系数
 
 // ============================================================================
-// 8. 疏果/击打执行机构舵机配置（接扩展板顶部 12 路舵机排针：D32 / D33 / D34）
+// 8. 四路疏果/击打执行机构舵机配置（接扩展板顶部 12 路舵机排针：D32 / D33 / D34 / D35）
 //    Mega 2560 上 Arduino Servo 库前 12 路独占 Timer5，不干扰 D5(Timer3)/D6-D8(Timer4) 电机 PWM
+//    实车通道映射（左右各上下错开两根独立外扩击打杆）：
+//      LD (左低) = D32
+//      RD (右低) = D33
+//      LU (左高) = D34
+//      RU (右高) = D35
 // ============================================================================
-constexpr uint8_t  SERVO_COUNT          = 3;
-constexpr uint8_t  PIN_SERVO_0          = 32;    // 舵机 0（D32，待标定具体方位）
-constexpr uint8_t  PIN_SERVO_1          = 33;    // 舵机 1（D33，待标定具体方位）
-constexpr uint8_t  PIN_SERVO_2          = 34;    // 舵机 2（D34，待标定具体方位）
-constexpr uint16_t SERVO_MIN_US         = 500;   // 0° 对应脉宽 (us)，适配常规 180°/270° 舵机
+constexpr uint8_t  SERVO_COUNT          = 4;
+constexpr uint8_t  PIN_SERVO_LD         = 32;    // 左低 (LD)
+constexpr uint8_t  PIN_SERVO_RD         = 33;    // 右低 (RD)
+constexpr uint8_t  PIN_SERVO_LU         = 34;    // 左高 (LU)
+constexpr uint8_t  PIN_SERVO_RU         = 35;    // 右高 (RU)
+constexpr uint16_t SERVO_MIN_US         = 500;   // 0° 对应脉宽 (us)，适配 MG996R 180° 舵机
 constexpr uint16_t SERVO_MAX_US         = 2500;  // 180° 对应脉宽 (us)
-constexpr uint8_t  SERVO_CENTER_DEG     = 90;    // 安全中位角度
-constexpr uint8_t  SERVO_TEST_OFFSET    = 25;    // 连通性测试小幅摆动角度 (±25°，防顶死机械限位)
-constexpr uint16_t SERVO_TEST_STEP_MS   = 650;   // 每次测试摆动停留时间 (ms)
+constexpr uint8_t  SERVO_CENTER_DEG     = 90;    // 装舵盘调零中位角度 (90°)
+constexpr uint8_t  SERVO_TEST_OFFSET    = 25;    // 方向与连通性测试小幅摆动角度 (±25°，防顶死限位)
+constexpr uint16_t SERVO_TEST_STEP_MS   = 900;   // 测试动作每步停留时间 (ms)
+
+// 四路击打杆独立【竖直收回角】与【向外扩 90° 击打角】（已实测标定方向，两端均留足 30° 机械余量）
+//   外扩为角度增大 (+): LD(左低/D32)、RU(右高/D35) -> 竖直装杆 30°，外扩 90° = 120°（后续最多还可扩到 150°）
+//   外扩为角度减小 (-): RD(右低/D33)、LU(左高/D34) -> 竖直装杆 150°，外扩 90° = 60°（后续最多还可扩到 30°）
+constexpr uint8_t  SERVO_LD_IDLE_DEG    = 30;    // 左低 (D32) 竖直收回角
+constexpr uint8_t  SERVO_LD_STRIKE_DEG  = 120;   // 左低 (D32) 外扩 90° 击打角 (+90°)
+constexpr uint8_t  SERVO_RD_IDLE_DEG    = 150;   // 右低 (D33) 竖直收回角
+constexpr uint8_t  SERVO_RD_STRIKE_DEG  = 60;    // 右低 (D33) 外扩 90° 击打角 (-90°)
+constexpr uint8_t  SERVO_LU_IDLE_DEG    = 150;   // 左高 (D34) 竖直收回角
+constexpr uint8_t  SERVO_LU_STRIKE_DEG  = 60;    // 左高 (D34) 外扩 90° 击打角 (-90°)
+constexpr uint8_t  SERVO_RU_IDLE_DEG    = 30;    // 右高 (D35) 竖直收回角
+constexpr uint8_t  SERVO_RU_STRIKE_DEG  = 120;   // 右高 (D35) 外扩 90° 击打角 (+90°)
+constexpr uint16_t SERVO_STRIKE_HOLD_MS = 320;   // 单次外扩 90° 保持时长 (ms)，到位后自动回竖直位
+
+// ============================================================================
+// 9. 双路 OpenMV 视觉串口配置（接扩展板左下角 "四组UART串口" 2 和 3）
+//    对齐仓库 feat/openmv-v010 (openmv/当前版本/protocol.py & config.py):
+//      - 波特率：115200 bps (8N1)，OpenMV 端需将 config.py 的 UART_ENABLED 设为 True
+//      - 协议帧：$MV1,<seq>,<ms>,<state>,<cx>,<cy>,<w>,<h>,<pixels>,<gCnt>,<yCnt>*<XOR_HEX>\n
+//      - Serial2 (T16 / R17) <-> 视觉口 2（建议左 OpenMV：P4 TX -> R17, P5 RX -> T16）
+//      - Serial3 (T14 / R15) <-> 视觉口 3（建议右 OpenMV：P4 TX -> R15, P5 RX -> T14）
+// ============================================================================
+constexpr uint32_t OPENMV_BAUD_RATE        = 115200;
+constexpr uint16_t OPENMV_ONLINE_TIMEOUT_MS = 1000;  // 超过 1s 未收到合法 MV1 帧视为离线
 constexpr float    VEL_INTEGRAL_LIMIT      = 95.0f;   // 积分抗饱和限幅
 constexpr uint16_t VEL_FAULT_MS            = 450;     // 编码器断线/反相超过 450ms 自动切回开环防飞车保护
 

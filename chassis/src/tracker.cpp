@@ -165,6 +165,15 @@ void CorridorTracker::runTracking(uint32_t nowMs, bool forward) {
         params_.slowPwm + (static_cast<int32_t>(params_.basePwm - params_.slowPwm) * rem) / span);
   }
 
+  // 起步软加速斜坡（DRIVE_SOFT_START_MS）：防止刚进沟时四轮静摩擦差造成车头扭斜
+  const uint32_t elapsedMs = nowMs - trackStartMs_;
+  if (elapsedMs < DRIVE_SOFT_START_MS && speedMag > DRIVE_SOFT_START_PWM) {
+    int32_t ramp = static_cast<int32_t>(DRIVE_SOFT_START_PWM) +
+                   (static_cast<int32_t>(speedMag - DRIVE_SOFT_START_PWM) * static_cast<int32_t>(elapsedMs)) /
+                       static_cast<int32_t>(DRIVE_SOFT_START_MS);
+    speedMag = static_cast<int16_t>(ramp);
+  }
+
   // --------------------------------------------------------------------------
   // 2. 左右垄壁检测与横向偏差计算
   //    约定：errMm > 0 表示左侧空间更大（车体偏右），前向需向左纠偏

@@ -169,4 +169,10 @@ class MissionController {
   float homeStartDistMm_ = 0.0f;
   uint8_t frontStopStreak_ = 0;
   uint32_t lastFrontMs_ = 0;
+
+  // 单侧跟墙 PD 微分状态（用于出库直冲顶围栏与跨垄贴外围栏，平滑抑制画龙）
+  bool wallPrevErrValid_ = false;
+  int16_t wallPrevErrMm_ = 0;
+  uint32_t wallLastUpdateMs_ = 0;
+  float wallFilteredDErr_ = 0.0f;
 };
