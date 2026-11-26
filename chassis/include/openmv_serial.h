@@ -6,6 +6,7 @@
 
 #include <Arduino.h>
 #include "config.h"
+#include "harvest_run.h"
 
 // ============================================================================
 // 单路 OpenMV 串口接收与 MV1 协议解析器
@@ -35,6 +36,7 @@ class OpenMvPort {
 
   bool isOnline(uint32_t nowMs) const;
   const OpenMvFrame& latest() const { return latest_; }
+  const HarvestFrame& harvest() const { return harvest_; }
   const char* tag() const { return tag_; }
   uint32_t rawByteCount() const { return rawBytes_; }
   uint32_t validPacketCount() const { return validPkts_; }
@@ -57,6 +59,7 @@ class OpenMvPort {
   bool inFrame_ = false;
 
   OpenMvFrame latest_{};
+  HarvestFrame harvest_{};
   uint32_t rawBytes_ = 0;
   uint32_t validPkts_ = 0;
   uint32_t badCrcPkts_ = 0;

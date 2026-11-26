@@ -4,6 +4,7 @@
 //     叠加串级 ±5° 偏航角限幅与陀螺仪锁直，防止高速画龙或撞壁。
 // ============================================================================
 #include "tracker.h"
+#include "harvest_config.h"
 
 // ============================================================================
 // 垄沟居中循迹器实现：
@@ -20,6 +21,8 @@ void CorridorTracker::begin(MotorDriver* motors, UltrasonicArray* sensors, ImuSe
 }
 
 void CorridorTracker::stop() {
+  harvestHold_ = false;
+  harvestBraking_ = false;
   status_.mode = MODE_IDLE;
   status_.wallMode = WALL_NONE;
   status_.errMm = 0;
@@ -31,6 +34,27 @@ void CorridorTracker::stop() {
   resetController();
   if (motors_ != nullptr) {
     motors_->stopAll();
+  }
+}
+
+void CorridorTracker::setHarvestHold(bool hold, uint32_t nowMs) {
+  if (hold != harvestHold_) {
+    harvestHold_ = hold;
+    harvestBraking_ = hold;
+    harvestBrakeMs_ = nowMs;
+    smoothSpeedPwm_ = 0.0f;
+    lastSpeedRampMs_ = 0;
+    status_.cmdForward = 0;
+    status_.cmdTurn = 0;
+    if (hold) {
+      motors_->brakeAll();
+    } else {
+      motors_->stopAll();
+    }
+  }
+  if (harvestBraking_ && nowMs - harvestBrakeMs_ >= HARVEST_END_BRAKE_MS) {
+    motors_->stopAll();
+    harvestBraking_ = false;
   }
 }
 
@@ -159,9 +183,12 @@ void CorridorTracker::runTracking(uint32_t nowMs, bool forward) {
   const uint16_t stopMm = forward ? params_.frontStopMm : params_.rearStopMm;
   const uint16_t slowMm = forward ? params_.frontSlowMm : (params_.rearStopMm + 320U);
 
-  if ((nowMs - trackStartMs_) >= LANE_END_GUARD_MS && lead.lastUpdateMs != lastLeadUpdateMs_) {
+  const bool rawEnd = forward && singleLaneRawEnd_;
+  if ((rawEnd || (nowMs - trackStartMs_) >= LANE_END_GUARD_MS) && lead.lastUpdateMs != lastLeadUpdateMs_) {
     lastLeadUpdateMs_ = lead.lastUpdateMs;
-    if (lead.valid && lead.filteredMm <= stopMm) {
+    const bool reached = rawEnd ? (lead.rawMm >= US_MIN_VALID_MM && lead.rawMm <= stopMm)
+                                : (lead.valid && lead.filteredMm <= stopMm);
+    if (reached) {
       if (endStopStreak_ < 255) {
         endStopStreak_++;
       }
@@ -179,8 +206,11 @@ void CorridorTracker::runTracking(uint32_t nowMs, bool forward) {
     Serial.print(F("[TRACK] 到达"));
     Serial.print(forward ? F("前方") : F("后方"));
     Serial.print(F("停机距离: "));
-    Serial.print(lead.filteredMm);
+    Serial.print(rawEnd ? lead.rawMm : lead.filteredMm);
     Serial.println(F(" mm -> 已停稳"));
+    return;
+  }
+  if (forward && harvestHold_) {
     return;
   }
 
@@ -260,7 +290,12 @@ void CorridorTracker::runTracking(uint32_t nowMs, bool forward) {
   }
 
   // 统一平滑加减速斜率限制（消除起步、开阔区恢复巡航与超声阶梯减速时的顿挫蹿车）
+  const bool harvestLimited = forward && harvestSpeedCap_ > 0;
+  if (harvestLimited) {
+    speedMag = min(speedMag, harvestSpeedCap_);
+  }
   speedMag = rampSpeed(speedMag, nowMs);
+  const int16_t steerLimit = harvestLimited ? min(params_.maxSteerPwm, speedMag) : params_.maxSteerPwm;
 
   // --------------------------------------------------------------------------
   // 4. 串级偏航角限幅 (±5°) + 轻度麦轮微横移辅助（IMU 离线时自动回退传统 PD 差速）
@@ -291,12 +326,15 @@ void CorridorTracker::runTracking(uint32_t nowMs, bool forward) {
     yawErrDeg = ImuSerial::wrapAngleDeg(desiredYaw - imu_->yawDeg());
     const float yawKp = forward ? params_.kpYawHold : (params_.kpYawHold * 1.15f);
     cmdTurn = -static_cast<int16_t>(yawKp * yawErrDeg);
-    cmdTurn = constrain(cmdTurn, -params_.maxSteerPwm, params_.maxSteerPwm);
+    cmdTurn = constrain(cmdTurn, -steerLimit, steerLimit);
+    if (harvestLimited) {
+      cmdStrafe = constrain(cmdStrafe, -speedMag / 2, speedMag / 2);
+    }
     motors_->setMecanum(cmdForward, cmdStrafe, cmdTurn);
   } else {
     int16_t usSteer = static_cast<int16_t>(
         params_.kp * static_cast<float>(errMm) + params_.kd * filteredDErr_);
-    cmdTurn = constrain(forward ? -usSteer : usSteer, -params_.maxSteerPwm, params_.maxSteerPwm);
+    cmdTurn = constrain(forward ? -usSteer : usSteer, -steerLimit, steerLimit);
     motors_->setTank(cmdForward, cmdTurn);
   }
 

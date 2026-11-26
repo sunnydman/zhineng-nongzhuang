@@ -27,6 +27,7 @@ class EncoderArray {
   float avgDistanceMm() const;
   float avgSpeedMmPerSec() const;
   bool anyActivity() const;
+  uint32_t lastSampleMs() const { return lastSampleMs_; }
 
   // 底层硬件诊断：读取 A8-A15 (bit0..7) 的实时电平与逐脚原始边沿计数
   uint8_t rawPink() const;

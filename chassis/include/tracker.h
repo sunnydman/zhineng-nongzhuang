@@ -60,6 +60,9 @@ class CorridorTracker {
   void startReverse(uint32_t nowMs);
   void startReverseWithHeading(float targetYawDeg);
   void setSingleWallOverrideMm(uint16_t mm) { singleWallOverrideMm_ = mm; }
+  void setHarvestSpeedCap(int16_t pwm) { harvestSpeedCap_ = pwm; }
+  void setHarvestHold(bool hold, uint32_t nowMs);
+  void setSingleLaneRawEnd(bool enabled) { singleLaneRawEnd_ = enabled; }
   void startManualTest(uint32_t nowMs, uint32_t durationMs);
 
   void update(uint32_t nowMs);
@@ -99,4 +102,9 @@ class CorridorTracker {
   float smoothSpeedPwm_ = 0.0f;
   uint32_t lastSpeedRampMs_ = 0;
   uint16_t singleWallOverrideMm_ = 0;
+  int16_t harvestSpeedCap_ = -1;
+  bool harvestHold_ = false;
+  bool harvestBraking_ = false;
+  uint32_t harvestBrakeMs_ = 0;
+  bool singleLaneRawEnd_ = false;
 };

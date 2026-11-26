@@ -42,9 +42,11 @@ class ServoController {
 
   // 语义化动作接口（自动适配各路已标定的旋转方向）
   void retract(uint8_t idx);                       // 单路贴身收回
+  void retractAt(uint8_t idx, uint8_t angle);
   void retractAll(uint16_t gapMs = 200);           // 四路错峰全贴身收回
   void extend(uint8_t idx);                        // 单路外扩至击打位
   void triggerStrike(uint8_t idx, uint32_t nowMs); // 非阻塞单次击打（外扩 -> 保持 -> 自动收回）
+  void triggerStrikeAt(uint8_t idx, uint8_t angle, uint8_t home, uint32_t nowMs);
 
   // 停止测试/击打并释放全部舵机 PWM 信号（断力保护）
   void detachAll();
@@ -75,6 +77,7 @@ class ServoController {
   // 每路独立的非阻塞击打收回定时（支持左右并行独立击打，互不阻塞）
   bool strikeActive_[SERVO_COUNT] = {false, false, false, false};
   uint32_t strikeRetractAtMs_[SERVO_COUNT] = {0, 0, 0, 0};
+  uint8_t strikeHomeDeg_[SERVO_COUNT] = {};
 
   // 非阻塞标定测试状态机
   bool testing_ = false;

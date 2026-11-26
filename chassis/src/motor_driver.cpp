@@ -95,6 +95,9 @@ void MotorDriver::setWheel(WheelId wheel, int16_t pwm) {
     return;
   }
 
+  if (braking_) {
+    stopAll();
+  }
   pwm = constrain(pwm, -MOTOR_PWM_MAX, MOTOR_PWM_MAX);
   // 指令跨零换向（正<->负）时必须清零速度环积分，防止正向残留积分抵消反向纠偏导致越冲越远
   if ((cmdPwm_[wheel] > 0 && pwm < 0) || (cmdPwm_[wheel] < 0 && pwm > 0)) {
@@ -121,7 +124,7 @@ void MotorDriver::setWheel(WheelId wheel, int16_t pwm) {
 }
 
 void MotorDriver::updateVelocityLoop(const EncoderArray& encoders, uint32_t nowMs) {
-  if (!params_.velPidEnabled) {
+  if (braking_ || !params_.velPidEnabled) {
     return;
   }
 
@@ -230,6 +233,7 @@ void MotorDriver::setMecanum(int16_t forwardPwm, int16_t strafePwm, int16_t turn
 }
 
 void MotorDriver::stopAll() {
+  braking_ = false;
   for (uint8_t i = 0; i < WHEEL_COUNT; ++i) {
     const auto& ch = kChannels[i];
     analogWrite(ch.enPin, 0);
@@ -244,8 +248,13 @@ void MotorDriver::stopAll() {
 }
 
 void MotorDriver::brakeAll() {
+  if (braking_) {
+    return;
+  }
+  braking_ = true;
   for (uint8_t i = 0; i < WHEEL_COUNT; ++i) {
     const auto& ch = kChannels[i];
+    analogWrite(ch.enPin, 0);
     digitalWrite(ch.in1Pin, HIGH);
     digitalWrite(ch.in2Pin, HIGH);
     analogWrite(ch.enPin, MOTOR_PWM_MAX);

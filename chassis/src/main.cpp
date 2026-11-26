@@ -17,6 +17,8 @@
 
 #include "config.h"
 #include "encoder_array.h"
+#include "harvest_config.h"
+#include "harvest_dual.h"
 #include "imu_serial.h"
 #include "mission.h"
 #include "motor_driver.h"
@@ -25,6 +27,10 @@
 #include "storage.h"
 #include "tracker.h"
 #include "ultrasonic_array.h"
+
+static_assert(HARVEST_STRIKE_CYCLE_MS > SERVO_STRIKE_HOLD_MS,
+              "Harvest cycle must include a retract interval after the servo timer");
+static_assert(HARVEST_WORK_SERVO_CHANNEL < SERVO_COUNT, "Invalid harvest servo channel");
 
 namespace {
 
@@ -37,6 +43,23 @@ OpenMvManager gOpenMv;       // Serial2 + Serial3 双路 OpenMV 接收器（MV1 
 CorridorTracker gTracker;    // 垄沟居中循迹 + IMU 锁直 + 端头防撞控制器
 MissionController gMission;  // 全程闭环与单步测试任务状态机
 ServoController gServos;     // 三路舵机控制器（D32 / D33 / D34，占用 Timer5）
+HarvestRun gHarvest;
+bool gHarvestTrial = false;
+int8_t gHarvestStrikeChannel = -1;
+uint8_t gHarvestWheelActivity = 0;
+int16_t gHarvestTrialPwm = 0;
+HarvestStation gHarvestTrialStation{0, 0, 0};
+HarvestDual gDualHarvest;
+bool gDualLane = false;
+bool gStopLane = false;
+size_t gStopStation = 0;
+uint32_t gLastTreeMs = 0;
+uint32_t gDualStartMs = 0;
+float gDualStartMm = 0;
+int8_t gDualChannels[2] = {-1, -1};
+uint32_t gDualStrikeMs[2] = {};
+bool gLaneBraking = false;
+uint32_t gLaneBrakeMs = 0;
 
 // 串口实时遥测开关与节拍
 bool gStreamTelemetry = false;
@@ -45,7 +68,7 @@ uint32_t gLastTelemetryMs = 0;
 // 发车倒计时状态（用于实体按键或上电自动发车，期间可随时急停取消）
 bool gArmedCountdown = false;
 uint32_t gLaunchAtMs = 0;
-uint8_t gLaunchMode = 2;  // 1=L形测试(直行->转弯->直行)，2=全程比赛闭环
+uint8_t gLaunchMode = 2;  // 1=L 形，2=全程，5=旧双边单沟，6=单边停车
 uint8_t gLaunchLanes = AUTO_START_LANES;
 
 // 实体启动/急停按键消抖状态
@@ -59,10 +82,279 @@ char gCmdBuf[kCmdBufSize];
 size_t gCmdLen = 0;
 
 // 立即取消一切倒计时、任务、循迹与舵机测试，并停机
+void cancelHarvest() {
+  if (gHarvestStrikeChannel >= 0) {
+    gServos.retractAt(static_cast<uint8_t>(gHarvestStrikeChannel), HARVEST_WORK_HOME_DEG);
+    gHarvestStrikeChannel = -1;
+  }
+  for (auto& channel : gDualChannels) {
+    if (channel >= 0) {
+      gServos.retract(static_cast<uint8_t>(channel));
+      channel = -1;
+    }
+  }
+  gDualLane = false;
+  gStopLane = false;
+  gLaneBraking = false;
+  gDualHarvest = HarvestDual{};
+  gHarvestTrial = false;
+  gHarvestWheelActivity = 0;
+  gHarvest = HarvestRun{};
+  gTracker.setHarvestSpeedCap(-1);
+  gTracker.setHarvestHold(false, 0);
+  gTracker.setSingleLaneRawEnd(false);
+}
+
 void cancelAll() {
   gArmedCountdown = false;
   gMission.abort();
   gServos.stopTest();
+  cancelHarvest();
+}
+
+const HarvestFrame& harvestFrame() {
+  return (HARVEST_CAMERA_PORT == 2 ? gOpenMv.port2() : gOpenMv.port3()).harvest();
+}
+
+const HarvestFrame& sideFrame(uint8_t side) {
+  const bool port2 = (side == 0) == HARVEST_LEFT_IS_PORT2;
+  return (port2 ? gOpenMv.port2() : gOpenMv.port3()).harvest();
+}
+
+void armDualLane(uint32_t nowMs) {
+  cancelAll();
+  gLaunchMode = 5;
+  gLaunchAtMs = nowMs + AUTO_START_DELAY_MS;
+  // 倒计时内归位，舵机错峰动作，车轮保持停机。
+  gServos.retractAll(150);
+  gArmedCountdown = true;
+  Serial.println(F("[ARM] Dual-side single-lane test, 3 s from arming. X/Space cancels."));
+}
+
+bool stopCameraFresh(const HarvestFrame& frame, uint32_t nowMs) {
+  return frame.received && frame.stopMode && nowMs - frame.rxMs <= HARVEST_FRAME_FRESH_MS;
+}
+
+void armStopLane(uint32_t nowMs) {
+  cancelAll();
+  gLaunchMode = 6;
+  gLaunchAtMs = nowMs + AUTO_START_DELAY_MS;
+  if (HARVEST_WORK_READY) {
+    gServos.retractAt(HARVEST_WORK_SERVO_CHANNEL, HARVEST_WORK_HOME_DEG);
+  }
+  gArmedCountdown = true;
+  Serial.println(F("[ARM] Single-side stop-and-strike lane, 3 s. X cancels."));
+}
+
+void startStopLane(uint32_t nowMs) {
+  if (!stopCameraFresh(harvestFrame(), nowMs) || !gUltrasonics.allSampledOnce()) {
+    Serial.println(F("[LANE_TEST] HV2 camera/ultrasonic not ready. Stays idle. Retry with HV LANE."));
+    return;
+  }
+  gDualStartMs = nowMs;
+  gDualStartMm = gEncoders.avgDistanceMm();
+  gLastTreeMs = nowMs;
+  gStopStation = 0;
+  gStopLane = true;
+  gTracker.setSingleLaneRawEnd(true);
+  gTracker.setHarvestSpeedCap(HARVEST_SCAN_PWM);
+  gTracker.startForward(nowMs);
+  Serial.println(HARVEST_WORK_READY ? F("[LANE_TEST] Single-side start")
+                                   : F("[LANE_TEST] Single-side start, servo angles unset"));
+}
+
+void startDualLane(uint32_t nowMs) {
+  cancelAll();
+  const auto& left = sideFrame(0);
+  const auto& right = sideFrame(1);
+  if (!left.received || !right.received || left.stopMode || right.stopMode ||
+      nowMs - left.rxMs > HARVEST_FRAME_FRESH_MS ||
+      nowMs - right.rxMs > HARVEST_FRAME_FRESH_MS || !gUltrasonics.allSampledOnce()) {
+    Serial.println(F("[LANE_TEST] HV1 cameras/ultrasonic not ready. Retry with HV DUAL."));
+    return;
+  }
+  gDualStartMs = nowMs;
+  gDualStartMm = gEncoders.avgDistanceMm();
+  gDualLane = true;
+  gTracker.setHarvestSpeedCap(HARVEST_SCAN_PWM);
+  gTracker.setSingleLaneRawEnd(true);
+  gTracker.startForward(nowMs);
+  Serial.print(F("[LANE_TEST] Start, front slow/stop mm="));
+  Serial.print(gTracker.params().frontSlowMm);
+  Serial.print('/');
+  Serial.println(gTracker.params().frontStopMm);
+}
+
+void finishHarvestLane(uint32_t nowMs, bool atEnd, bool cameraLost = false) {
+  if (!atEnd) {
+    gTracker.stop();
+  }
+  cancelHarvest();
+  gMotors.brakeAll();
+  gLaneBraking = true;
+  gLaneBrakeMs = nowMs;
+  if (cameraLost) {
+    Serial.println(F("[LANE_TEST] HV2 signal expired -> stop"));
+  } else {
+    Serial.println(atEnd ? F("[LANE_TEST] End wall -> stop, no turn")
+                         : F("[LANE_TEST] Distance/time limit -> stop"));
+  }
+}
+
+void updateDualLane(uint32_t nowMs) {
+  if (gTracker.status().mode != MODE_TRACK_FWD) {
+    finishHarvestLane(nowMs, gTracker.hasReachedEnd());
+    return;
+  }
+  const float odom = gEncoders.avgDistanceMm();
+  if (odom - gDualStartMm >= HARVEST_TEST_MAX_MM || nowMs - gDualStartMs >= HARVEST_TEST_MAX_MS) {
+    finishHarvestLane(nowMs, false);
+    return;
+  }
+  const auto& front = gUltrasonics.get(US_FRONT);
+  const bool rawValid = front.rawMm >= US_MIN_VALID_MM && front.rawMm <= US_MAX_VALID_MM;
+  const uint16_t frontMm = rawValid && front.valid ? min(front.rawMm, front.filteredMm)
+      : (rawValid ? front.rawMm : (front.valid ? front.filteredMm : US_MAX_VALID_MM));
+  const bool nearEnd = frontMm <= gTracker.params().frontSlowMm;
+  float maxWheelSpeed = 0;
+  for (uint8_t i = 0; i < WHEEL_COUNT; ++i) {
+    const float speed = fabs(gEncoders.speedMmPerSec(static_cast<WheelId>(i)));
+    maxWheelSpeed = max(maxWheelSpeed, speed);
+  }
+  const float reserveMm = HARVEST_MAX_STRIKE_MMS * HARVEST_STRIKE_CYCLE_MS / 1000.0f +
+                          HARVEST_END_RESERVE_MM;
+  const bool mayStrike = frontMm > gTracker.params().frontStopMm + reserveMm &&
+                         gEncoders.avgSpeedMmPerSec() >= HARVEST_MIN_MOVING_MMS &&
+                         maxWheelSpeed <= HARVEST_MAX_STRIKE_MMS;
+  const bool wasSlow = gDualHarvest.slow();
+  gDualHarvest.update(sideFrame(0), sideFrame(1), odom, mayStrike, nowMs);
+  gTracker.setHarvestSpeedCap(gDualHarvest.slow() || nearEnd ? HARVEST_SCAN_PWM : HARVEST_TEST_CRUISE_PWM);
+  if (wasSlow != gDualHarvest.slow()) {
+    Serial.println(gDualHarvest.slow() ? F("[LANE_TEST] Slow: tree or camera unresolved")
+                                     : F("[LANE_TEST] Both sides cleared"));
+  }
+  for (uint8_t side = 0; side < 2; ++side) {
+    if (gDualChannels[side] >= 0 && nowMs - gDualStrikeMs[side] >= HARVEST_STRIKE_CYCLE_MS) {
+      gDualChannels[side] = -1;
+    }
+    const char target = gDualHarvest.takeStrike(side);
+    if (target == 'H' || target == 'L') {
+      const uint8_t channel = side == 0 ? (target == 'H' ? SERVO_LU : SERVO_LD)
+                                       : (target == 'H' ? SERVO_RU : SERVO_RD);
+      gDualChannels[side] = channel;
+      gDualStrikeMs[side] = nowMs;
+      gServos.triggerStrike(channel, nowMs);
+    }
+  }
+}
+
+void updateHarvest(uint32_t nowMs) {
+  if (gDualLane) {
+    updateDualLane(nowMs);
+    return;
+  }
+  const auto& frame = harvestFrame();
+  const float odom = gEncoders.avgDistanceMm();
+  if (gStopLane) {
+    if (gTracker.status().mode != MODE_TRACK_FWD) {
+      finishHarvestLane(nowMs, gTracker.hasReachedEnd());
+      return;
+    }
+    if (!stopCameraFresh(frame, nowMs)) {
+      finishHarvestLane(nowMs, false, true);
+      return;
+    }
+    if (odom - gDualStartMm >= HARVEST_TEST_MAX_MM || nowMs - gDualStartMs >= HARVEST_TEST_MAX_MS) {
+      finishHarvestLane(nowMs, false);
+      return;
+    }
+  }
+  const uint8_t lane = gHarvestTrial || gStopLane ? 1 : gMission.currentLane();
+  const bool selected = gHarvestTrial || gStopLane || (HARVEST_MISSION_LANE != 0 &&
+      gMission.state() == MS_TRACK_LANE && lane == HARVEST_MISSION_LANE);
+  const bool inLane = selected && gTracker.status().mode == MODE_TRACK_FWD;
+  float maxSpeed = 0;
+  if (inLane) {
+    for (uint8_t i = 0; i < WHEEL_COUNT; ++i) {
+      const float speed = fabs(gEncoders.speedMmPerSec(static_cast<WheelId>(i)));
+      maxSpeed = max(maxSpeed, speed);
+      if (speed > HARVEST_STOPPED_WHEEL_MMS) {
+        gHarvestWheelActivity |= 1U << i;
+      }
+    }
+  } else {
+    gHarvestWheelActivity = 0;
+  }
+  const auto before = gHarvest.state();
+  const HarvestStation* station = gHarvestTrial ? &gHarvestTrialStation : &HARVEST_STATION;
+  if (gStopLane) {
+    if (gStopStation < HARVEST_LANE_STATION_COUNT) {
+      station = &HARVEST_LANE_STATIONS[gStopStation];
+    } else {
+      station = nullptr;
+    }
+    if (frame.nearFruit) {
+      gLastTreeMs = frame.rxMs;
+    }
+  }
+  const auto& front = gUltrasonics.get(US_FRONT);
+  const uint32_t minimumFrontMm = static_cast<uint32_t>(gTracker.params().frontStopMm) + HARVEST_END_RESERVE_MM;
+  const bool frontClear = front.lastUpdateMs != 0 && nowMs - front.lastUpdateMs <= HARVEST_FRAME_FRESH_MS &&
+      front.rawMm > minimumFrontMm && front.rawMm <= US_MAX_VALID_MM &&
+      (!front.valid || front.filteredMm > minimumFrontMm);
+  const bool encoderFresh = gEncoders.lastSampleMs() != 0 &&
+      nowMs - gEncoders.lastSampleMs() <= 150;
+  if (station != nullptr) {
+    const bool wheelsObserved = gHarvestWheelActivity == (1U << WHEEL_COUNT) - 1;
+    gHarvest.update(*station, inLane, lane, odom, maxSpeed,
+                    HARVEST_WORK_READY && frontClear && encoderFresh && wheelsObserved, frame, nowMs);
+  }
+  const auto after = gHarvest.state();
+  const bool trialCameraLost = gHarvestTrial && !stopCameraFresh(frame, nowMs);
+  if (gHarvestTrial && (!inLane || gHarvest.laneDistanceMm() >= station->endMm || trialCameraLost)) {
+    finishHarvestLane(nowMs, gTracker.hasReachedEnd(), trialCameraLost);
+    return;
+  }
+  if (!inLane && gHarvestStrikeChannel >= 0) {
+    cancelHarvest();
+    return;
+  }
+  const int16_t cap = gHarvestTrial ? gHarvestTrialPwm : HARVEST_SCAN_PWM;
+  const int16_t stationCap = gHarvest.speedCap(cap);
+  gTracker.setHarvestHold(inLane && gHarvest.holding(), nowMs);
+  if (gStopLane) {
+    const bool slowing = nowMs - gLastTreeMs < HARVEST_TREE_HOLD_MS ||
+                        (front.valid && front.filteredMm <= gTracker.params().frontSlowMm);
+    gTracker.setHarvestSpeedCap(slowing || stationCap >= 0 ? cap : HARVEST_TEST_CRUISE_PWM);
+  } else {
+    gTracker.setHarvestSpeedCap(gHarvestTrial ? cap : stationCap);
+  }
+  if (before != after && after != HarvestRun::OUTSIDE) {
+    Serial.print(F("[HV] "));
+    Serial.print(HarvestRun::stateName(after));
+    Serial.print(' ');
+    Serial.print(gHarvest.event());
+    Serial.print(F(" mm="));
+    Serial.print(gHarvest.laneDistanceMm(), 0);
+    Serial.print(F(" fruit="));
+    Serial.println(gHarvest.target());
+    if (after == HarvestRun::STRIKE) {
+      gHarvestStrikeChannel = HARVEST_WORK_SERVO_CHANNEL;
+      gServos.triggerStrikeAt(HARVEST_WORK_SERVO_CHANNEL,
+                              gHarvest.target() == 'H' ? HARVEST_WORK_HIGH_DEG : HARVEST_WORK_LOW_DEG,
+                              HARVEST_WORK_HOME_DEG, nowMs);
+    }
+  }
+  if (after == HarvestRun::DONE) {
+    gHarvestStrikeChannel = -1;  // 已过保守回收等待，舵机位置仍需通过实测确认。
+    if (gHarvestTrial) {
+      cancelHarvest();
+      gTracker.stop();
+    } else if (gStopLane && station != nullptr) {
+      ++gStopStation;
+      gHarvest.advanceStation();
+    }
+  }
 }
 
 // 预约或立即启动全程比赛任务（delayMs=0 表示立即发车）
@@ -289,6 +581,36 @@ void printTelemetry(uint32_t nowMs) {
     Serial.print(F(" | V=")); Serial.print(gEncoders.avgSpeedMmPerSec(), 0);
     Serial.print(F("mm/s D=")); Serial.print(gEncoders.avgDistanceMm(), 0);
     Serial.print(F("mm"));
+  }
+  const auto& obs = harvestFrame();
+  Serial.print(F(" | HV mm=")); Serial.print(gHarvest.laneDistanceMm(), 0);
+  Serial.print(' '); Serial.print(HarvestRun::stateName(gHarvest.state()));
+  Serial.print(F(" seq="));
+  if (obs.received) {
+    Serial.print(obs.seq);
+    Serial.print(obs.stopMode ? F(" HV2") : F(" HV1"));
+    Serial.print(F(" near=")); Serial.print(obs.nearFruit);
+    Serial.print(F(" target=")); Serial.print(obs.target);
+    Serial.print(F(" align=")); Serial.print(obs.aligned);
+    Serial.print(F(" age=")); Serial.print(nowMs - obs.rxMs);
+  } else {
+    Serial.print(F("---"));
+  }
+  if (gDualLane) {
+    Serial.print(F(" | lane="));
+    Serial.print(gEncoders.avgDistanceMm() - gDualStartMm, 0);
+    Serial.print(gDualHarvest.slow() ? F(" slow") : F(" clear"));
+    for (uint8_t side = 0; side < 2; ++side) {
+      const auto& camera = sideFrame(side);
+      Serial.print(side == 0 ? F(" L:") : F(" R:"));
+      Serial.print(gDualHarvest.occupied(side));
+      Serial.print('/');
+      Serial.print(camera.target);
+      Serial.print('/');
+      Serial.print(camera.aligned);
+      Serial.print('/');
+      Serial.print(nowMs - camera.rxMs);
+    }
   }
   Serial.println();
 }
@@ -520,6 +842,45 @@ void processCommandLine(char* line) {
   if (strcmp(tok0, "x") == 0 || strcmp(tok0, "stop") == 0) {
     cancelAll();
     Serial.println(F("[CMD] STOP"));
+  } else if (strcmp(tok0, "hv") == 0) {
+    char* action = strtok(nullptr, " \t");
+    if (action != nullptr) {
+      toLowerStr(action);
+      if (strcmp(action, "lane") == 0) {
+        armStopLane(nowMs);
+        return;
+      }
+      if (strcmp(action, "dual") == 0) {
+        armDualLane(nowMs);
+        return;
+      }
+    }
+    char* pwmStr = strtok(nullptr, " \t");
+    char* distStr = strtok(nullptr, " \t");
+    if (action != nullptr) toLowerStr(action);
+    const long pwm = pwmStr ? atol(pwmStr) : 0;
+    const long dist = distStr ? atol(distStr) : 0;
+    if (action == nullptr || strcmp(action, "run") != 0 ||
+        pwm < 1 || pwm > 45 || dist < 50 || dist > 600) {
+      Serial.println(F("Usage: HV LANE | HV DUAL | HV RUN <pwm 1..45> <max mm 50..600>"));
+      return;
+    }
+    const auto& frame = harvestFrame();
+    if (!stopCameraFresh(frame, nowMs)) {
+      Serial.println(F("[HV] No fresh HV2 frames on the configured camera"));
+      return;
+    }
+    cancelAll();
+    gHarvestTrialStation = {0, 0, static_cast<float>(dist)};
+    gHarvestTrialPwm = static_cast<int16_t>(pwm);
+    gHarvestTrial = true;
+    if (HARVEST_WORK_READY) {
+      gServos.retractAt(HARVEST_WORK_SERVO_CHANNEL, HARVEST_WORK_HOME_DEG);
+    }
+    gTracker.setHarvestSpeedCap(gHarvestTrialPwm);
+    gTracker.setSingleLaneRawEnd(true);
+    gTracker.startForward(nowMs);
+    Serial.println(F("[HV] Stop-and-strike trial for one tree"));
   } else if (strcmp(tok0, "g") == 0) {
     cancelAll();
     gTracker.startForward(nowMs);
@@ -684,6 +1045,10 @@ void processCommandLine(char* line) {
     Serial.print(F(" (")); Serial.print((pwm >= 0) ? F("RIGHT") : F("LEFT"));
     Serial.print(F(") dur=")); Serial.print(durMs); Serial.println(F(" ms"));
   } else if (strcmp(tok0, "sv") == 0) {
+    if (gDualLane || gStopLane || gHarvestTrial || gHarvestStrikeChannel >= 0) {
+      Serial.println(F("[HV] Stop the harvest run before using SV manual commands"));
+      return;
+    }
     // 四路击打舵机控制（LD=32左低, RD=33右低, LU=34左高, RU=35右高）：
     //   SV HOME / SV IN           -> 四路错峰全部贴身收回 (LD=30, RD=150, LU=150, RU=30)
     //   SV OUT <ld|rd|lu|ru|all>  -> 按标定方向外扩 120° 至击打位
@@ -863,6 +1228,10 @@ void pollStartButton(uint32_t nowMs) {
       if (gArmedCountdown || gMission.isActive() || gTracker.status().mode != MODE_IDLE) {
         cancelAll();
         Serial.println(F("[BTN] Pressed while active -> EMERGENCY STOP."));
+      } else if (gLaunchMode == 6) {
+        armStopLane(nowMs);
+      } else if (gLaunchMode == 5) {
+        armDualLane(nowMs);
       } else {
         armFullMatch(AUTO_START_LANES, BTN_START_DELAY_MS, nowMs);
       }
@@ -891,6 +1260,14 @@ void updateStatusLed(uint32_t nowMs) {
 // ============================================================================
 void setup() {
   gMotors.begin();  // 第一时间确保四路电机停机，防止上电乱动
+  const uint32_t bootMs = millis();
+#if defined(HARVEST_STOP_LANE_AUTOSTART)
+  constexpr uint8_t autoStartMode = 6;
+#elif defined(HARVEST_SINGLE_LANE_AUTOSTART)
+  constexpr uint8_t autoStartMode = 5;
+#else
+  constexpr uint8_t autoStartMode = AUTO_START_MODE;
+#endif
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, LOW);
   if (ENABLE_START_BUTTON) {
@@ -918,19 +1295,23 @@ void setup() {
   printHelp();
   printConfigSummary();
 
-  if (AUTO_START_MODE == 1) {
+  if (autoStartMode == 6) {
+    armStopLane(bootMs);
+  } else if (autoStartMode == 5) {
+    armDualLane(bootMs);
+  } else if (autoStartMode == 1) {
     armAutoLTest(AUTO_START_DELAY_MS, millis());
-  } else if (AUTO_START_MODE == 2) {
+  } else if (autoStartMode == 2) {
     gServos.retractAll(150);  // 发车前先将 4 根击打杆锁死在竖直贴身位，防碰田垄/树枝
     armFullMatch(AUTO_START_LANES, AUTO_START_DELAY_MS, millis());
-  } else if (AUTO_START_MODE == 3) {
+  } else if (autoStartMode == 3) {
     gArmedCountdown = true;
     gLaunchMode = 3;
     gLaunchAtMs = millis() + AUTO_START_DELAY_MS;
     Serial.print(F("[ARM] Standalone Servo Loop Test on D"));
     Serial.print(AUTO_SERVO_TEST_PIN);
     Serial.println(F(" starting in 1.5s... (motors stay IDLE)"));
-  } else if (AUTO_START_MODE == 4) {
+  } else if (autoStartMode == 4) {
     gServos.retractAll(150);  // 发车前先收拢 4 根击打杆至竖直贴身位
     gArmedCountdown = true;
     gLaunchMode = 4;
@@ -957,7 +1338,11 @@ void loop() {
   // 3. 倒计时到点后自动切入预约任务（1=L形测试，2=全程比赛，3=舵机循环，4=单垄居中循迹）
   if (gArmedCountdown && static_cast<int32_t>(nowMs - gLaunchAtMs) >= 0) {
     gArmedCountdown = false;
-    if (gLaunchMode == 1) {
+    if (gLaunchMode == 6) {
+      startStopLane(nowMs);
+    } else if (gLaunchMode == 5) {
+      startDualLane(nowMs);
+    } else if (gLaunchMode == 1) {
       gMission.startLTest(
           AUTO_LTEST_LEG1_MM, AUTO_LTEST_TURN_LEFT, AUTO_LTEST_LEG2_MM, AUTO_LTEST_ARC_SIGN, nowMs);
     } else if (gLaunchMode == 3) {
@@ -988,10 +1373,23 @@ void loop() {
   gImu.update(nowMs);
   gOpenMv.update(nowMs);
   gEncoders.update(nowMs);
+  updateHarvest(nowMs);
 
   // 7. 若有新的超声采样（或处于手动限时测试），推进底盘循迹控制器
   if (sampled || gTracker.status().mode == MODE_MANUAL_TEST) {
     gTracker.update(nowMs);
+  }
+  if ((gDualLane || gStopLane) && gTracker.hasReachedEnd()) {
+    finishHarvestLane(nowMs, true);
+  }
+  if (gLaneBraking && nowMs - gLaneBrakeMs >= HARVEST_END_BRAKE_MS) {
+    gMotors.stopAll();
+    gLaneBraking = false;
+    const auto& front = gUltrasonics.get(US_FRONT);
+    Serial.print(F("[LANE_TEST] After brake, front raw/filtered mm="));
+    Serial.print(front.rawMm);
+    Serial.print('/');
+    Serial.println(front.filteredMm);
   }
 
   // 8. 推进全程任务状态机与三路舵机非阻塞测试状态机

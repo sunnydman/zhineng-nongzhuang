@@ -15,6 +15,7 @@ void OpenMvPort::begin(HardwareSerial* port, const char* tag, uint32_t baud) {
   lineLen_ = 0;
   inFrame_ = false;
   latest_ = OpenMvFrame{};
+  harvest_ = HarvestFrame{};
   rawBytes_ = 0;
   validPkts_ = 0;
   badCrcPkts_ = 0;
@@ -99,7 +100,30 @@ void OpenMvPort::handleLine(uint32_t nowMs, bool logPackets) {
     return;
   }
 
-  *star = '\0';  // 截断 '*XX'，便于 strtok 解析 CSV 字段
+  *star = '\0';  // 截断 '*XX'，便于解析 CSV 字段
+  const bool stopMode = strncmp(lineBuf_, "HV2,", 4) == 0;
+  if (stopMode || strncmp(lineBuf_, "HV1,", 4) == 0) {
+    const char* fields = lineBuf_ + 4;
+    char* tail = nullptr;
+    const unsigned long seq = strtoul(fields, &tail, 10);
+    if (*fields >= '0' && *fields <= '9' && seq <= 65535UL && star[3] == '\0' &&
+        strlen(tail) == 6 && tail[0] == ',' && tail[2] == ',' && tail[4] == ',' &&
+        (tail[1] == '0' || tail[1] == '1') && (tail[5] == '0' || tail[5] == '1') &&
+        (tail[3] == 'N' || tail[3] == 'H' || tail[3] == 'L') &&
+        (tail[5] == '0' || tail[3] != 'N') && (tail[1] == '1' || tail[3] == 'N')) {
+      if (harvest_.received && harvest_.stopMode == stopMode && harvest_.seq == seq) {
+        return;
+      }
+      harvest_.received = true;
+      harvest_.seq = static_cast<uint16_t>(seq);
+      harvest_.rxMs = nowMs;
+      harvest_.nearFruit = tail[1] == '1';
+      harvest_.target = tail[3];
+      harvest_.aligned = tail[5] == '1';
+      harvest_.stopMode = stopMode;
+    }
+    return;
+  }
   char* fields[11];
   uint8_t count = 0;
   char* tok = strtok(lineBuf_, ",");

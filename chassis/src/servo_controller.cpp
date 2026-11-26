@@ -122,15 +122,21 @@ void ServoController::setAllStaggered(uint8_t deg, uint16_t gapMs) {
 }
 
 void ServoController::retract(uint8_t idx) {
+  if (idx < SERVO_COUNT) {
+    retractAt(idx, kIdleDeg[idx]);
+  }
+}
+
+void ServoController::retractAt(uint8_t idx, uint8_t angle) {
   if (idx >= SERVO_COUNT) {
     return;
   }
   strikeActive_[idx] = false;
-  setAngle(idx, kIdleDeg[idx]);
+  setAngle(idx, angle);
   Serial.print(F("[SERVO] 收回 "));
   Serial.print(kNames[idx]);
   Serial.print(F(" -> "));
-  Serial.print(kIdleDeg[idx]);
+  Serial.print(angle);
   Serial.println(F(" deg"));
 }
 
@@ -158,20 +164,27 @@ void ServoController::extend(uint8_t idx) {
 }
 
 void ServoController::triggerStrike(uint8_t idx, uint32_t nowMs) {
+  if (idx < SERVO_COUNT) {
+    triggerStrikeAt(idx, kStrikeDeg[idx], kIdleDeg[idx], nowMs);
+  }
+}
+
+void ServoController::triggerStrikeAt(uint8_t idx, uint8_t angle, uint8_t home, uint32_t nowMs) {
   if (idx >= SERVO_COUNT) {
     return;
   }
   testing_ = false;
   loopMode_ = false;
-  setAngle(idx, kStrikeDeg[idx]);
+  setAngle(idx, angle);
+  strikeHomeDeg_[idx] = home;
   strikeActive_[idx] = true;
   strikeRetractAtMs_[idx] = nowMs + SERVO_STRIKE_HOLD_MS;
   Serial.print(F("[SERVO] 击打触发 "));
   Serial.print(kNames[idx]);
   Serial.print(F(" : "));
-  Serial.print(kIdleDeg[idx]);
+  Serial.print(home);
   Serial.print(F(" -> "));
-  Serial.print(kStrikeDeg[idx]);
+  Serial.print(angle);
   Serial.println(F(" deg (自动收回)"));
 }
 
@@ -229,11 +242,11 @@ void ServoController::update(uint32_t nowMs) {
   for (uint8_t i = 0; i < SERVO_COUNT; ++i) {
     if (strikeActive_[i] && static_cast<int32_t>(nowMs - strikeRetractAtMs_[i]) >= 0) {
       strikeActive_[i] = false;
-      setAngle(i, kIdleDeg[i]);
+      setAngle(i, strikeHomeDeg_[i]);
       Serial.print(F("[SERVO] 击打完成自动收回 "));
       Serial.print(kNames[i]);
       Serial.print(F(" -> "));
-      Serial.print(kIdleDeg[i]);
+      Serial.print(strikeHomeDeg_[i]);
       Serial.println(F(" deg"));
     }
   }

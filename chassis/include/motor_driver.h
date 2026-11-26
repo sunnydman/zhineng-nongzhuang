@@ -72,6 +72,7 @@ class MotorDriver {
 
   static const MotorChannelConfig kChannels[WHEEL_COUNT];
   MotorParams params_;
+  bool braking_ = false;
   int16_t cmdPwm_[WHEEL_COUNT] = {0, 0, 0, 0};
   int16_t appliedPwm_[WHEEL_COUNT] = {0, 0, 0, 0};
   int8_t lastDir_[WHEEL_COUNT] = {0, 0, 0, 0};

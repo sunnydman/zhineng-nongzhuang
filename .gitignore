@@ -9,3 +9,9 @@ Desktop.ini
 !.env.example
 
 # Add build-output rules after confirming the actual toolchain.
+
+# PlatformIO / editor / local dataset
+.pio/
+.vscode/
+__pycache__/
+数据集/
