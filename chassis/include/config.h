@@ -115,6 +115,8 @@ constexpr uint8_t AUTO_START_MODE =
 constexpr uint16_t AUTO_START_DELAY_MS = 3000; // 上电发车倒计时 (ms)
 constexpr uint8_t AUTO_START_LANES =
     7; // 模式 2（全程比赛）遍历垄沟数（专本组为 7 条沟）
+constexpr bool KEEP_HEADING_NO_UTURN =
+    true; // true=进沟后永不180°掉头(前进/倒车交替,端头统一右转->跨垄->左转); false=传统U弯掉头
 constexpr uint8_t AUTO_SERVO_TEST_PIN =
     33; // 模式 3 自动循环测试的舵机引脚 (32 / 33 / 34)
 
@@ -142,7 +144,7 @@ constexpr uint16_t BTN_START_DELAY_MS = 1500;
 constexpr int16_t DEFAULT_BASE_PWM =
     170; // 高速巡航指令 (VelPID 下约 600 mm/s ≈ 0.60 m/s，保留充足纠偏余量)
 constexpr int16_t DEFAULT_REVERSE_PWM =
-    115; // 1 号沟倒车回库专用速度 (约 406 mm/s，IMU 强锁直稳退)
+    130; // 倒车过沟与回库专用速度 (约 459 mm/s，IMU 强锁直稳过毛毯)
 constexpr int16_t DEFAULT_SLOW_PWM =
     75; // 接近端头或开阔区降速指令 (约 265 mm/s，平顺刹停)
 constexpr uint16_t DRIVE_SOFT_START_MS = 180; // 兼容保留：起步斜坡参考时长 (ms)
@@ -156,7 +158,7 @@ constexpr uint16_t DEFAULT_FRONT_SLOW_MM =
 constexpr uint16_t DEFAULT_FRONT_STOP_MM =
     155; // 前超声 <=155mm (适配提速滑行 + 纯原地转弯零碰墙)
 constexpr uint16_t DEFAULT_REAR_STOP_MM =
-    115; // 倒车后超声 <=115mm (多退 25mm 增大回库原地转弯时的离垄净空)
+    135; // 倒车后超声 <=135mm (兼顾偶数沟左端头原地右转90°净空与1号沟回库)
 constexpr uint16_t DEFAULT_SIDE_WALL_MAX_MM =
     240; // 居中 82mm、贴对侧墙 ~137mm（+5%公差约 160mm）；>240mm
          // 判定该侧开阔无墙

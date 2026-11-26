@@ -5,7 +5,7 @@
 > **重要提醒（EEPROM 覆盖机制）**
 > 若之前在串口执行过 `SAVE`，上电会优先加载 EEPROM 参数覆盖 `config.h` 中的 `DEFAULT_*` 默认值。修改 `config.h` 后要让新默认值生效，二选一：
 > 1. 烧录后在串口发送 `RESETCFG`；
-> 2. 将 [`src/storage.cpp` L15](src/storage.cpp#L15) 的 `kVersion`（当前 `27`）加 1 后再烧录。
+> 2. 将 [`src/storage.cpp` L15](src/storage.cpp#L15) 的 `kVersion`（当前 `28`）加 1 后再烧录。
 
 ---
 
@@ -38,22 +38,23 @@
 | [L112-L114](include/config.h#L112-L114) | `AUTO_START_MODE` | `2` | 需重烧 | `0`待机 / `1`L形测 / `2`完整7垄 / `3`舵机循环 / `4`单垄居中 |
 | [L115](include/config.h#L115) | `AUTO_START_DELAY_MS` | `3000` | 需重烧 | 上电发车倒计时（ms） |
 | [L116-L117](include/config.h#L116-L117) | `AUTO_START_LANES` | `7` | 需重烧 | 模式 2 遍历垄沟总数 |
-| [L118-L119](include/config.h#L118-L119) | `AUTO_SERVO_TEST_PIN` | `33` | 需重烧 | 模式 3 测试的舵机引脚（32/33/34/35） |
-| [L122-L126](include/config.h#L122-L126) | `AUTO_LTEST_LEG1_MM` / `TURN_LEFT` / `LEG2_MM` / `ARC_SIGN` | `800 / false / 800 / 0` | 需重烧 | 模式 1 的 L 形测试两段距离、转向与弧线开关 |
-| [L131-L134](include/config.h#L131-L134) | `ENABLE_START_BUTTON` / `PIN` / `DEBOUNCE` / `DELAY` | `true / 2 / 40 / 1500` | 需重烧 | D2 物理启动/急停按钮配置 |
+| [L118-L119](include/config.h#L118-L119) | `KEEP_HEADING_NO_UTURN` | `true` | 需重烧 | `true`=进沟不掉头（前进/倒车交替）；`false`=传统 U 弯掉头 |
+| [L120-L121](include/config.h#L120-L121) | `AUTO_SERVO_TEST_PIN` | `33` | 需重烧 | 模式 3 测试的舵机引脚（32/33/34/35） |
+| [L124-L128](include/config.h#L124-L128) | `AUTO_LTEST_LEG1_MM` / `TURN_LEFT` / `LEG2_MM` / `ARC_SIGN` | `800 / false / 800 / 0` | 需重烧 | 模式 1 的 L 形测试两段距离、转向与弧线开关 |
+| [L133-L136](include/config.h#L133-L136) | `ENABLE_START_BUTTON` / `PIN` / `DEBOUNCE` / `DELAY` | `true / 2 / 40 / 1500` | 需重烧 | D2 物理启动/急停按钮配置 |
 
 ### 2. 直行速度、平顺加减速与端头停距
 | 行号 | 参数名 | 当前值 | 串口 `SET` | 说明 |
 | :--- | :--- | :--- | :--- | :--- |
-| [L142-L143](include/config.h#L142-L143) | `DEFAULT_BASE_PWM` | `170` | `spd` | 沟内巡航指令（VelPID 下约 0.60 m/s） |
-| [L144-L145](include/config.h#L144-L145) | `DEFAULT_REVERSE_PWM` | `115` | 需重烧 | 1 号沟倒车回库专用速度（约 0.41 m/s，稳直不甩尾） |
-| [L146-L147](include/config.h#L146-L147) | `DEFAULT_SLOW_PWM` | `75` | `slow` | 端头或开阔区降速指令（约 0.26 m/s） |
-| [L149](include/config.h#L149) | `DRIVE_SOFT_START_PWM` | `50` | 需重烧 | 平滑起步初始速度指令 |
-| [L150-L151](include/config.h#L150-L151) | `SPEED_ACCEL_PWM_PER_SEC` | `260.0f` | 需重烧 | 统一平滑加速斜率（PWM/s） |
-| [L152-L153](include/config.h#L152-L153) | `SPEED_DECEL_PWM_PER_SEC` | `380.0f` | 需重烧 | 统一平滑减速斜率（PWM/s） |
-| [L154-L155](include/config.h#L154-L155) | `DEFAULT_FRONT_SLOW_MM` | `580` | 需重烧 | 前超声提前线性减速距离（mm） |
-| [L156-L157](include/config.h#L156-L157) | `DEFAULT_FRONT_STOP_MM` | `155` | `stop` | 前超声端头停车阈值（mm） |
-| [L158-L159](include/config.h#L158-L159) | `DEFAULT_REAR_STOP_MM` | `115` | `rstop` | 倒车后超声停车阈值（mm，越小退越深离 1 号垄越远） |
+| [L144-L145](include/config.h#L144-L145) | `DEFAULT_BASE_PWM` | `170` | `spd` | 沟内巡航指令（VelPID 下约 0.60 m/s） |
+| [L146-L147](include/config.h#L146-L147) | `DEFAULT_REVERSE_PWM` | `130` | 需重烧 | 偶数沟倒车过沟与回库专用速度（约 0.46 m/s，稳直过毛毯） |
+| [L148-L149](include/config.h#L148-L149) | `DEFAULT_SLOW_PWM` | `75` | `slow` | 端头或开阔区降速指令（约 0.26 m/s） |
+| [L151](include/config.h#L151) | `DRIVE_SOFT_START_PWM` | `50` | 需重烧 | 平滑起步初始速度指令 |
+| [L152-L153](include/config.h#L152-L153) | `SPEED_ACCEL_PWM_PER_SEC` | `260.0f` | 需重烧 | 统一平滑加速斜率（PWM/s） |
+| [L154-L155](include/config.h#L154-L155) | `SPEED_DECEL_PWM_PER_SEC` | `380.0f` | 需重烧 | 统一平滑减速斜率（PWM/s） |
+| [L156-L157](include/config.h#L156-L157) | `DEFAULT_FRONT_SLOW_MM` | `580` | 需重烧 | 前超声提前线性减速距离（mm） |
+| [L158-L159](include/config.h#L158-L159) | `DEFAULT_FRONT_STOP_MM` | `155` | `stop` | 前超声端头停车阈值（mm） |
+| [L160-L161](include/config.h#L160-L161) | `DEFAULT_REAR_STOP_MM` | `135` | `rstop` | 倒车后超声停车阈值（mm，兼顾偶数沟左端头转弯与回库） |
 
 ### 3. 垄沟居中、贴墙与串级纠偏
 | 行号 | 参数名 | 当前值 | 串口 `SET` | 说明 |

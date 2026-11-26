@@ -415,9 +415,11 @@ void MissionController::update(uint32_t nowMs) {
     case MS_SETTLE_BEFORE_TURN1:
       motors_->stopAll();
       if ((nowMs - stateEnterMs_) >= params_.settleMs) {
+        // 不掉头模式：无论在右端头还是左端头，车头均朝 -90°(+X)，统一右转 90° 到 180°(-Y) 直行跨垄
+        bool turn1Left = (KEEP_HEADING_NO_UTURN && job_ != JOB_LANE_CHANGE) ? false : currentTurnLeft_;
         nominalHeadingDeg_ = ImuSerial::wrapAngleDeg(
-            nominalHeadingDeg_ + (currentTurnLeft_ ? 90.0f : -90.0f));
-        startTurnStep(MS_TURN_1, nominalHeadingDeg_, currentTurnLeft_, +1, nowMs);
+            nominalHeadingDeg_ + (turn1Left ? 90.0f : -90.0f));
+        startTurnStep(MS_TURN_1, nominalHeadingDeg_, turn1Left, +1, nowMs);
       }
       return;
 
@@ -462,9 +464,11 @@ void MissionController::update(uint32_t nowMs) {
     case MS_SETTLE_BEFORE_TURN2:
       motors_->stopAll();
       if ((nowMs - stateEnterMs_) >= params_.settleMs) {
+        // 不掉头模式：跨垄结束车头朝 180°(-Y)，统一左转 90° 回到 -90°(+X)，保持车身朝向永不翻转
+        bool turn2Left = (KEEP_HEADING_NO_UTURN && job_ != JOB_LANE_CHANGE) ? true : currentTurnLeft_;
         nominalHeadingDeg_ = ImuSerial::wrapAngleDeg(
-            nominalHeadingDeg_ + (currentTurnLeft_ ? 90.0f : -90.0f));
-        startTurnStep(MS_TURN_2, nominalHeadingDeg_, currentTurnLeft_, +1, nowMs);
+            nominalHeadingDeg_ + (turn2Left ? 90.0f : -90.0f));
+        startTurnStep(MS_TURN_2, nominalHeadingDeg_, turn2Left, +1, nowMs);
       }
       return;
 
@@ -486,15 +490,24 @@ void MissionController::update(uint32_t nowMs) {
         }
         currentLane_++;
         currentTurnLeft_ = !currentTurnLeft_;
+        bool laneReverse = KEEP_HEADING_NO_UTURN && ((currentLane_ % 2) == 0);
         Serial.print(F("[MISSION] 进入第 "));
         Serial.print(currentLane_);
         Serial.print('/');
         Serial.print(totalLanes_);
-        Serial.println(F(" 垄"));
-        if (imu_ != nullptr && imu_->isOnline(nowMs)) {
-          tracker_->startForwardWithHeading(nominalHeadingDeg_);
+        Serial.println(laneReverse ? F(" 垄（不掉头倒车过沟）") : F(" 垄（正向过沟）"));
+        if (laneReverse) {
+          if (imu_ != nullptr && imu_->isOnline(nowMs)) {
+            tracker_->startReverseWithHeading(nominalHeadingDeg_);
+          } else {
+            tracker_->startReverse(nowMs);
+          }
         } else {
-          tracker_->startForward(nowMs);
+          if (imu_ != nullptr && imu_->isOnline(nowMs)) {
+            tracker_->startForwardWithHeading(nominalHeadingDeg_);
+          } else {
+            tracker_->startForward(nowMs);
+          }
         }
         enterState(MS_TRACK_LANE, nowMs);
       }
@@ -524,9 +537,8 @@ void MissionController::update(uint32_t nowMs) {
     case MS_SETTLE_BEFORE_HOME:
       motors_->stopAll();
       if ((nowMs - stateEnterMs_) >= params_.settleMs) {
-        // 奇数沟倒车停在 X≈250 朝向 +X：后退偏置弧线右转 90°(-1) 刚好收正进 400mm 入口中线
-        // 偶数沟正向停在 X≈260 朝向 -X：前向偏置弧线左转 90°(+1) 收正进入口中线
-        bool turnLeftToHome = ((totalLanes_ % 2) == 0);
+        // 不掉头模式下，无论奇偶沟停在左围栏前车头均朝 -90°(+X)，统一右转 90° 到 180°(-Y) 面向入口
+        bool turnLeftToHome = KEEP_HEADING_NO_UTURN ? false : ((totalLanes_ % 2) == 0);
         int8_t arcSign = turnLeftToHome ? +1 : -1;
         nominalHeadingDeg_ = 180.0f;
         startTurnStep(MS_TURN_HOME, nominalHeadingDeg_, turnLeftToHome, arcSign, nowMs);
