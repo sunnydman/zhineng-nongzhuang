@@ -1,3 +1,8 @@
+// ============================================================================
+// 【文件作用】垄沟内居中循迹控制器实现（直行/倒车走正 + 到端头自动减速稳停）
+//   - 双侧都有墙时按 L=R 居中，单侧有墙（如短垄缺口）时贴单侧墙保持目标距离，
+//     叠加串级 ±5° 偏航角限幅与陀螺仪锁直，防止高速画龙或撞壁。
+// ============================================================================
 #include "tracker.h"
 
 // ============================================================================
@@ -84,6 +89,29 @@ void CorridorTracker::resetController() {
   filteredDErr_ = 0.0f;
   endStopStreak_ = 0;
   lastLeadUpdateMs_ = 0;
+  smoothSpeedPwm_ = 0.0f;
+  lastSpeedRampMs_ = 0;
+  singleWallOverrideMm_ = 0;
+}
+
+int16_t CorridorTracker::rampSpeed(int16_t targetPwm, uint32_t nowMs) {
+  if (lastSpeedRampMs_ == 0) {
+    lastSpeedRampMs_ = nowMs;
+    smoothSpeedPwm_ = static_cast<float>(min(targetPwm, DRIVE_SOFT_START_PWM));
+    return static_cast<int16_t>(smoothSpeedPwm_);
+  }
+  uint32_t dtMs = nowMs - lastSpeedRampMs_;
+  if (dtMs > 0) {
+    lastSpeedRampMs_ = nowMs;
+    float dtSec = min(static_cast<float>(dtMs) * 0.001f, 0.10f);
+    float target = static_cast<float>(targetPwm);
+    if (target > smoothSpeedPwm_) {
+      smoothSpeedPwm_ = min(target, smoothSpeedPwm_ + SPEED_ACCEL_PWM_PER_SEC * dtSec);
+    } else if (target < smoothSpeedPwm_) {
+      smoothSpeedPwm_ = max(target, smoothSpeedPwm_ - SPEED_DECEL_PWM_PER_SEC * dtSec);
+    }
+  }
+  return static_cast<int16_t>(smoothSpeedPwm_);
 }
 
 void CorridorTracker::update(uint32_t nowMs) {
@@ -129,7 +157,7 @@ void CorridorTracker::runTracking(uint32_t nowMs, bool forward) {
   // --------------------------------------------------------------------------
   const auto& lead = forward ? f : b;
   const uint16_t stopMm = forward ? params_.frontStopMm : params_.rearStopMm;
-  const uint16_t slowMm = forward ? params_.frontSlowMm : (params_.rearStopMm + 190U);
+  const uint16_t slowMm = forward ? params_.frontSlowMm : (params_.rearStopMm + 320U);
 
   if ((nowMs - trackStartMs_) >= LANE_END_GUARD_MS && lead.lastUpdateMs != lastLeadUpdateMs_) {
     lastLeadUpdateMs_ = lead.lastUpdateMs;
@@ -156,22 +184,14 @@ void CorridorTracker::runTracking(uint32_t nowMs, bool forward) {
     return;
   }
 
-  // 进入减速区后线性降速至 slowPwm，减小停机惯性滑行误差
-  int16_t speedMag = params_.basePwm;
+  // 进入减速区后线性降速至 slowPwm，减小停机惯性滑行误差（倒车采用专用稳速，防止高速甩尾画龙）
+  const int16_t cruisePwm = forward ? params_.basePwm : min(params_.basePwm, DEFAULT_REVERSE_PWM);
+  int16_t speedMag = cruisePwm;
   if (lead.valid && lead.filteredMm < slowMm && slowMm > stopMm) {
     int32_t span = static_cast<int32_t>(slowMm - stopMm);
     int32_t rem = (lead.filteredMm > stopMm) ? static_cast<int32_t>(lead.filteredMm - stopMm) : 0;
     speedMag = static_cast<int16_t>(
-        params_.slowPwm + (static_cast<int32_t>(params_.basePwm - params_.slowPwm) * rem) / span);
-  }
-
-  // 起步软加速斜坡（DRIVE_SOFT_START_MS）：防止刚进沟时四轮静摩擦差造成车头扭斜
-  const uint32_t elapsedMs = nowMs - trackStartMs_;
-  if (elapsedMs < DRIVE_SOFT_START_MS && speedMag > DRIVE_SOFT_START_PWM) {
-    int32_t ramp = static_cast<int32_t>(DRIVE_SOFT_START_PWM) +
-                   (static_cast<int32_t>(speedMag - DRIVE_SOFT_START_PWM) * static_cast<int32_t>(elapsedMs)) /
-                       static_cast<int32_t>(DRIVE_SOFT_START_MS);
-    speedMag = static_cast<int16_t>(ramp);
+        params_.slowPwm + (static_cast<int32_t>(cruisePwm - params_.slowPwm) * rem) / span);
   }
 
   // --------------------------------------------------------------------------
@@ -183,18 +203,20 @@ void CorridorTracker::runTracking(uint32_t nowMs, bool forward) {
 
   WallMode wallMode = WALL_NONE;
   int16_t errMm = 0;
+  const uint16_t singleWallTargetMm =
+      (singleWallOverrideMm_ > 0) ? singleWallOverrideMm_ : params_.singleWallMm;
   if (leftValid && rightValid) {
     // 双侧都有垄壁/围栏：以左右等距为中线（自动适应 ±5% 沟宽公差）
     wallMode = WALL_BOTH;
     errMm = static_cast<int16_t>(l.filteredMm) - static_cast<int16_t>(r.filteredMm);
   } else if (leftValid) {
-    // 仅左侧有墙（例如刚过短垄 R4 开口）：贴左墙保持 singleWallMm(85mm)
+    // 仅左侧有墙（如第 1 垄末端或短垄 R4 开口）：贴左墙保持目标距离
     wallMode = WALL_LEFT_ONLY;
-    errMm = static_cast<int16_t>(l.filteredMm) - static_cast<int16_t>(params_.singleWallMm);
+    errMm = static_cast<int16_t>(l.filteredMm) - static_cast<int16_t>(singleWallTargetMm);
   } else if (rightValid) {
-    // 仅右侧有墙：贴右墙保持 singleWallMm(85mm)
+    // 仅右侧有墙：贴右墙保持目标距离
     wallMode = WALL_RIGHT_ONLY;
-    errMm = static_cast<int16_t>(params_.singleWallMm) - static_cast<int16_t>(r.filteredMm);
+    errMm = static_cast<int16_t>(singleWallTargetMm) - static_cast<int16_t>(r.filteredMm);
   } else {
     // 两侧均开阔：仅靠 IMU 锁直并低速通过
     wallMode = WALL_NONE;
@@ -237,26 +259,46 @@ void CorridorTracker::runTracking(uint32_t nowMs, bool forward) {
     lastSideUpdateMs_ = sideUpdateMs;
   }
 
-  int16_t usSteer = static_cast<int16_t>(
-      params_.kp * static_cast<float>(errMm) + params_.kd * filteredDErr_);
+  // 统一平滑加减速斜率限制（消除起步、开阔区恢复巡航与超声阶梯减速时的顿挫蹿车）
+  speedMag = rampSpeed(speedMag, nowMs);
 
   // --------------------------------------------------------------------------
-  // 4. IMU 航向保持环（与超声横向居中叠加，防止斜角和画龙）
+  // 4. 串级偏航角限幅 (±5°) + 轻度麦轮微横移辅助（IMU 离线时自动回退传统 PD 差速）
+  //    约定：errMm > 0 车体偏右，前进需向左切 (yawOffset > 0)、倒车车头需向右偏 (yawOffset < 0)
   // --------------------------------------------------------------------------
   float yawErrDeg = 0.0f;
-  int16_t yawSteer = 0;
-  const bool imuActive = useHeadingHold_ && (imu_ != nullptr) && imu_->isOnline(nowMs);
-  if (imuActive) {
-    yawErrDeg = ImuSerial::wrapAngleDeg(targetYawDeg_ - imu_->yawDeg());
-    yawSteer = static_cast<int16_t>(params_.kpYawHold * yawErrDeg);
-  }
-
-  // 差速合成规则：
-  // - 超声居中：前进时偏右(err>0)需左转(-usSteer)；倒车时偏右需车尾向左收(+usSteer)
-  // - 航向保持：无论前进还是倒车，目标角在左(yawErr>0)均需车体逆时针转(-yawSteer)
   int16_t cmdForward = forward ? speedMag : -speedMag;
-  int16_t cmdTurn = (forward ? -usSteer : usSteer) - yawSteer;
-  cmdTurn = constrain(cmdTurn, -params_.maxSteerPwm, params_.maxSteerPwm);
+  int16_t cmdTurn = 0;
+  int16_t cmdStrafe = 0;
+  const bool imuActive = useHeadingHold_ && (imu_ != nullptr) && imu_->isOnline(nowMs);
+
+  if (imuActive) {
+    float rawYawOff = 0.0f;
+    if (wallMode != WALL_NONE) {
+      // 倒车时以 IMU 死锁直线为主，横向超声外环切入角收紧至 ±2.5°、增益减半，避免倒车甩尾画龙
+      const float kpCascade = forward ? CASCADE_KP_DEG_PER_MM : (CASCADE_KP_DEG_PER_MM * 0.5f);
+      const float maxYawOff = forward ? CASCADE_MAX_YAW_DEG : (CASCADE_MAX_YAW_DEG * 0.5f);
+      rawYawOff = kpCascade * static_cast<float>(errMm) +
+                  CASCADE_KD_DEG_PER_MMS * filteredDErr_;
+      rawYawOff = constrain(rawYawOff, -maxYawOff, maxYawOff);
+      cmdStrafe = constrain(
+          -static_cast<int16_t>(DRIVE_STRAFE_KP * static_cast<float>(errMm)),
+          -DRIVE_STRAFE_MAX_PWM,
+          DRIVE_STRAFE_MAX_PWM);
+    }
+    float signedYawOff = forward ? rawYawOff : -rawYawOff;
+    float desiredYaw = ImuSerial::wrapAngleDeg(targetYawDeg_ + signedYawOff);
+    yawErrDeg = ImuSerial::wrapAngleDeg(desiredYaw - imu_->yawDeg());
+    const float yawKp = forward ? params_.kpYawHold : (params_.kpYawHold * 1.15f);
+    cmdTurn = -static_cast<int16_t>(yawKp * yawErrDeg);
+    cmdTurn = constrain(cmdTurn, -params_.maxSteerPwm, params_.maxSteerPwm);
+    motors_->setMecanum(cmdForward, cmdStrafe, cmdTurn);
+  } else {
+    int16_t usSteer = static_cast<int16_t>(
+        params_.kp * static_cast<float>(errMm) + params_.kd * filteredDErr_);
+    cmdTurn = constrain(forward ? -usSteer : usSteer, -params_.maxSteerPwm, params_.maxSteerPwm);
+    motors_->setTank(cmdForward, cmdTurn);
+  }
 
   status_.wallMode = wallMode;
   status_.errMm = errMm;
@@ -264,8 +306,6 @@ void CorridorTracker::runTracking(uint32_t nowMs, bool forward) {
   status_.headingLocked = imuActive;
   status_.cmdForward = cmdForward;
   status_.cmdTurn = cmdTurn;
-
-  motors_->setTank(cmdForward, cmdTurn);
 }
 
 const char* CorridorTracker::modeName(TrackerMode mode) {

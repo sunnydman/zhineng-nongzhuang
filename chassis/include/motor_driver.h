@@ -1,3 +1,7 @@
+// ============================================================================
+// 【文件作用】四路直流电机驱动头文件（声明接口，平时调参不用改）
+//   - 负责 L298N 电机驱动、四轮独立速度 PI 闭环及差速/麦轮输出定义。
+// ============================================================================
 #pragma once
 
 #include <Arduino.h>
@@ -40,6 +44,10 @@ class MotorDriver {
 
   // 差速控制：forwardPwm > 0 前进，turnPwm > 0 右转，turnPwm < 0 左转
   void setTank(int16_t forwardPwm, int16_t turnPwm);
+
+  // 麦轮全向控制（顶视 X / 底视 O 布局）：
+  //   forwardPwm > 0 前进，strafePwm > 0 向右平移，turnPwm > 0 顺时针右转
+  void setMecanum(int16_t forwardPwm, int16_t strafePwm, int16_t turnPwm);
 
   // 滑行停止（EN=0, IN1=0, IN2=0）
   void stopAll();

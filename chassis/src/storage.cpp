@@ -1,3 +1,8 @@
+// ============================================================================
+// 【文件作用】EEPROM 掉电参数读写实现（魔数 + 版本号 kVersion + 校验和）
+//   - 若之前在串口发过 SAVE，开机时会自动加载 EEPROM 参数覆盖 config.h 默认值；
+//   - 改了 config.h 默认值想强制生效时，把下方 kVersion 数字加 1 即可。
+// ============================================================================
 #include "storage.h"
 
 #include <EEPROM.h>
@@ -7,7 +12,7 @@ namespace {
 
 constexpr int kEepromAddr = 0;
 constexpr uint32_t kMagic = 0x4D475431UL;  // "MGT1"
-constexpr uint16_t kVersion = 8;
+constexpr uint16_t kVersion = 27;
 
 struct PersistedBlock {
   uint32_t magic;

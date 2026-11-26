@@ -1,3 +1,10 @@
+// ============================================================================
+// 【文件作用】全程 7 垄比赛与 U 形换垄任务状态机实现
+//   - 串起整场比赛的每一步：启动区柔和出库直冲顶围栏 -> 90° 过弯进第 7 沟 ->
+//     7 垄蛇形遍历（每次端头 90° -> 扫垄边沿+里程兜底跨垄 -> 90° 进新沟）->
+//     第 1 沟倒车对口 -> 90° 对正入口 -> 编码器直行停入启动区。
+//   - 所有距离/速度/转弯参数都在 include/config.h 修改，一般不用改此文件。
+// ============================================================================
 #include "mission.h"
 
 #include <math.h>
@@ -53,6 +60,28 @@ void MissionController::enterState(MissionState next, uint32_t nowMs) {
   wallPrevErrMm_ = 0;
   wallLastUpdateMs_ = 0;
   wallFilteredDErr_ = 0.0f;
+  smoothSpeedPwm_ = 0.0f;
+  lastSpeedRampMs_ = 0;
+}
+
+int16_t MissionController::rampSpeed(int16_t targetPwm, uint32_t nowMs) {
+  if (lastSpeedRampMs_ == 0) {
+    lastSpeedRampMs_ = nowMs;
+    smoothSpeedPwm_ = static_cast<float>(min(targetPwm, DRIVE_SOFT_START_PWM));
+    return static_cast<int16_t>(smoothSpeedPwm_);
+  }
+  uint32_t dtMs = nowMs - lastSpeedRampMs_;
+  if (dtMs > 0) {
+    lastSpeedRampMs_ = nowMs;
+    float dtSec = min(static_cast<float>(dtMs) * 0.001f, 0.10f);
+    float target = static_cast<float>(targetPwm);
+    if (target > smoothSpeedPwm_) {
+      smoothSpeedPwm_ = min(target, smoothSpeedPwm_ + SPEED_ACCEL_PWM_PER_SEC * dtSec);
+    } else if (target < smoothSpeedPwm_) {
+      smoothSpeedPwm_ = max(target, smoothSpeedPwm_ - SPEED_DECEL_PWM_PER_SEC * dtSec);
+    }
+  }
+  return static_cast<int16_t>(smoothSpeedPwm_);
 }
 
 void MissionController::startDriveDistanceMm(int16_t distMm, uint32_t nowMs) {
@@ -112,8 +141,8 @@ void MissionController::startTurnStep(
   Serial.print(F("[MISSION] "));
   Serial.print(stateName(turnState));
   Serial.print(turnLeft ? F(" 左转90° ") : F(" 右转90° "));
-  if (arcSign > 0) Serial.print(F("[前向弧线] "));
-  else if (arcSign < 0) Serial.print(F("[后退弧线] "));
+  if (arcSign > 0 && params_.turnArcRatio > 0.01f) Serial.print(F("[前向弧线] "));
+  else if (arcSign < 0 && params_.turnArcRatio > 0.01f) Serial.print(F("[后退弧线] "));
   else Serial.print(F("[原地旋转] "));
 
   if (turnUseImu_) {
@@ -189,7 +218,8 @@ void MissionController::startFullMatch(uint8_t totalLanes, uint32_t nowMs) {
 
   Serial.print(F("[MISSION] === 启动完整比赛闭环 ("));
   Serial.print(totalLanes_);
-  Serial.println(F(" 垄) === 出库直冲顶围栏 -> 蛇形回1号沟 -> 倒车对口 -> 回启动区"));
+  Serial.println(F(" 垄) === 串级柔和出库(无平移) -> 轻弧线0碰墙蛇形 -> 倒车回库"));
+  exitStartDistMm_ = (encoders_ != nullptr) ? encoders_->avgDistanceMm() : 0.0f;
   enterState(MS_EXIT_TO_TOP, nowMs);
 }
 
@@ -297,7 +327,16 @@ void MissionController::update(uint32_t nowMs) {
       }
       return;
 
-    // 阶段 1：启动区出发，沿左通道(+Y)直冲至顶围栏(Y=4600)
+    // 阶段 0：发车前原地麦轮微横移对中（锁死 0° 航向，先对齐左外围栏 76mm 再柔和出库）
+    case MS_ALIGN_START:
+      if (stepAlignStart(nowMs)) {
+        motors_->stopAll();
+        exitStartDistMm_ = (encoders_ != nullptr) ? encoders_->avgDistanceMm() : 0.0f;
+        enterState(MS_EXIT_TO_TOP, nowMs);
+      }
+      return;
+
+    // 阶段 1：启动区出发，沿左通道(+Y)串级限幅直冲至顶围栏(Y=4600)
     case MS_EXIT_TO_TOP:
       if (stepExitToTop(nowMs)) {
         motors_->stopAll();
@@ -335,6 +374,8 @@ void MissionController::update(uint32_t nowMs) {
         } else {
           tracker_->startForward(nowMs);
         }
+        // 仅第 1 垄(7号沟)末端左侧贴上方围栏使用独立目标，其他垄自动恢复通用 singleWallMm
+        tracker_->setSingleWallOverrideMm(DEFAULT_LANE1_LEFT_WALL_MM);
         enterState(MS_TRACK_LANE, nowMs);
       }
       return;
@@ -345,14 +386,11 @@ void MissionController::update(uint32_t nowMs) {
         if (currentLane_ >= totalLanes_) {
           if (job_ == JOB_FULL_MATCH) {
             if ((totalLanes_ % 2) == 1) {
-              // 奇数条沟(如 7 沟)结束于 1 号沟右围栏 -> 倒车沿 1 号沟退回左围栏入口处
-              Serial.println(F("[MISSION] 最后一条沟完成 -> 沿 1 号沟倒车对准左围栏入口"));
-              if (imu_ != nullptr && imu_->isOnline(nowMs)) {
-                tracker_->startReverseWithHeading(nominalHeadingDeg_);
-              } else {
-                tracker_->startReverse(nowMs);
-              }
-              enterState(MS_RETURN_REVERSE, nowMs);
+              // 奇数条沟(如 7 沟)结束于 1 号沟右围栏 -> 先刹稳清滤波，再沿 1 号沟笔直倒车退回左围栏入口
+              Serial.println(F("[MISSION] 最后一条沟完成 -> 停稳后沿 1 号沟倒车对准左围栏入口"));
+              motors_->stopAll();
+              sensors_->clearFilters();
+              enterState(MS_SETTLE_BEFORE_REVERSE, nowMs);
             } else {
               // 偶数条沟结束于左围栏 -> 直接左转 90° 面向启动区
               Serial.println(F("[MISSION] 最后一条沟完成(左围栏) -> 准备左转入库"));
@@ -405,7 +443,11 @@ void MissionController::update(uint32_t nowMs) {
         crossCenterStartMs_ = 0;
         crossTotalStartDistMm_ = (encoders_ != nullptr) ? encoders_->avgDistanceMm() : 0.0f;
         crossCenterStartDistMm_ = crossTotalStartDistMm_;
-        Serial.println(F("[MISSION] 开始跨垄（内侧超声扫垄端面 + 编码器 140mm 对中 / 680mm 兜底）"));
+        Serial.print(F("[MISSION] 开始跨垄（内侧扫垄 + 编码器 "));
+        Serial.print(params_.crossCenterMm);
+        Serial.print(F("mm 对中 / "));
+        Serial.print(params_.crossMaxDistMm);
+        Serial.println(F("mm 兜底）"));
         enterState(MS_CROSS_RIDGE, nowMs);
       }
       return;
@@ -458,7 +500,19 @@ void MissionController::update(uint32_t nowMs) {
       }
       return;
 
-    // 阶段 4：沿 1 号沟倒车至左围栏前（后超声 130mm 停稳）
+    // 阶段 4：1 号沟端头短停稳车 -> 沿 1 号沟笔直倒车至左围栏前停稳
+    case MS_SETTLE_BEFORE_REVERSE:
+      motors_->stopAll();
+      if ((nowMs - stateEnterMs_) >= params_.settleMs && sensors_->allSampledOnce()) {
+        if (imu_ != nullptr && imu_->isOnline(nowMs)) {
+          tracker_->startReverseWithHeading(nominalHeadingDeg_);
+        } else {
+          tracker_->startReverse(nowMs);
+        }
+        enterState(MS_RETURN_REVERSE, nowMs);
+      }
+      return;
+
     case MS_RETURN_REVERSE:
       if (tracker_->hasReachedEnd()) {
         motors_->stopAll();
@@ -542,16 +596,13 @@ bool MissionController::stepDriveDist(uint32_t nowMs) {
 
   const auto& tp = tracker_->params();
   float rem = targetAbs - progress;
-  int16_t spd = (rem < 180.0f) ? tp.slowPwm : tp.basePwm;
-
-  // 起步软加速斜坡（DRIVE_SOFT_START_MS）：让四轮从低速同步进入速度闭环，抑制静摩擦差异引起的起步歪斜
-  const uint32_t elapsedMs = nowMs - stateEnterMs_;
-  if (elapsedMs < DRIVE_SOFT_START_MS && spd > DRIVE_SOFT_START_PWM) {
-    int32_t ramp = static_cast<int32_t>(DRIVE_SOFT_START_PWM) +
-                   (static_cast<int32_t>(spd - DRIVE_SOFT_START_PWM) * static_cast<int32_t>(elapsedMs)) /
-                       static_cast<int32_t>(DRIVE_SOFT_START_MS);
-    spd = static_cast<int16_t>(ramp);
+  int16_t spd = tp.basePwm;
+  if (rem < 260.0f) {
+    int32_t r = max(0L, static_cast<int32_t>(rem));
+    spd = static_cast<int16_t>(
+        tp.slowPwm + (static_cast<int32_t>(tp.basePwm - tp.slowPwm) * r) / 260L);
   }
+  spd = rampSpeed(spd, nowMs);
 
   int16_t cmdFwd = forward ? spd : -spd;
 
@@ -563,6 +614,52 @@ bool MissionController::stepDriveDist(uint32_t nowMs) {
   }
 
   motors_->setTank(cmdFwd, yawTurn);
+  return false;
+}
+
+bool MissionController::stepAlignStart(uint32_t nowMs) {
+  if ((nowMs - stateEnterMs_) >= ALIGN_MAX_MS) {
+    Serial.println(F("[ALIGN] 达到原地对中限时 -> 转入串级柔和出库"));
+    return true;
+  }
+  if (!sensors_->allSampledOnce()) {
+    motors_->stopAll();
+    return false;
+  }
+
+  const auto& left = sensors_->get(US_LEFT);
+  const auto& tp = tracker_->params();
+  if (!left.valid || left.filteredMm > tp.sideWallMaxMm) {
+    // 左侧无墙（开阔）则直接跳过横移，靠陀螺仪锁直出库
+    return true;
+  }
+
+  // err > 0 表示车偏右（左距太大）需向左横移(strafe < 0)；err < 0 表示车偏左需向右横移(strafe > 0)
+  int16_t err = static_cast<int16_t>(left.filteredMm) - static_cast<int16_t>(params_.exitOuterWallMm);
+  if (abs(err) <= ALIGN_TOL_MM) {
+    motors_->stopAll();
+    if (alignInTolSinceMs_ == 0) {
+      alignInTolSinceMs_ = nowMs;
+    } else if ((nowMs - alignInTolSinceMs_) >= ALIGN_HOLD_MS) {
+      Serial.print(F("[ALIGN] 发车前原地横移对中完成，L="));
+      Serial.print(left.filteredMm);
+      Serial.println(F(" mm -> 发车！"));
+      return true;
+    }
+    return false;
+  }
+
+  alignInTolSinceMs_ = 0;
+  int16_t mag = constrain(abs(err) * 3, ALIGN_STRAFE_MIN_PWM, ALIGN_STRAFE_MAX_PWM);
+  int16_t strafe = (err > 0) ? -mag : mag;
+
+  int16_t yawTurn = 0;
+  if (imu_ != nullptr && imu_->isOnline(nowMs)) {
+    float yawErr = ImuSerial::wrapAngleDeg(nominalHeadingDeg_ - imu_->yawDeg());
+    yawTurn = constrain(-static_cast<int16_t>(tp.kpYawHold * yawErr), -35, 35);
+  }
+
+  motors_->setMecanum(0, strafe, yawTurn);
   return false;
 }
 
@@ -591,27 +688,11 @@ bool MissionController::stepExitToTop(uint32_t nowMs) {
     return true;
   }
 
-  int16_t speed = tp.basePwm;
-  if (front.valid && front.filteredMm < tp.frontSlowMm && tp.frontSlowMm > tp.frontStopMm) {
-    int32_t span = static_cast<int32_t>(tp.frontSlowMm - tp.frontStopMm);
-    int32_t rem = (front.filteredMm > tp.frontStopMm)
-                      ? static_cast<int32_t>(front.filteredMm - tp.frontStopMm)
-                      : 0;
-    speed = static_cast<int16_t>(
-        tp.slowPwm + (static_cast<int32_t>(tp.basePwm - tp.slowPwm) * rem) / span);
-  }
-  const uint32_t elapsedMs = nowMs - stateEnterMs_;
-  if (elapsedMs < DRIVE_SOFT_START_MS && speed > DRIVE_SOFT_START_PWM) {
-    speed = static_cast<int16_t>(
-        DRIVE_SOFT_START_PWM +
-        (static_cast<int32_t>(speed - DRIVE_SOFT_START_PWM) * static_cast<int32_t>(elapsedMs)) /
-            static_cast<int32_t>(DRIVE_SOFT_START_MS));
-  }
-
-  // 只跟左侧连续外围栏 (实测居中 70mm) PD 控距 + HWT101CT 0° 航向锁直，无视右侧 6 条田垄开口变化
-  int16_t usTurn = 0;
-  if (left.valid && left.filteredMm <= tp.sideWallMaxMm) {
-    int16_t err = static_cast<int16_t>(left.filteredMm) - static_cast<int16_t>(params_.crossOuterWallMm);
+  // 计算左墙横向偏差与平滑微分：err > 0 表示车偏右，需向左切回中线
+  bool leftValid = left.valid && (left.filteredMm <= tp.sideWallMaxMm);
+  int16_t err = 0;
+  if (leftValid) {
+    err = static_cast<int16_t>(left.filteredMm) - static_cast<int16_t>(params_.exitOuterWallMm);
     if (abs(err) <= tp.errDeadbandMm) {
       err = 0;
     }
@@ -629,21 +710,58 @@ bool MissionController::stepExitToTop(uint32_t nowMs) {
       wallPrevErrValid_ = true;
       wallLastUpdateMs_ = left.lastUpdateMs;
     }
-    usTurn = -static_cast<int16_t>(tp.kp * static_cast<float>(err) + tp.kd * wallFilteredDErr_);
-    usTurn = constrain(usTurn, -45, 45);
   } else {
     wallPrevErrValid_ = false;
     wallFilteredDErr_ = 0.0f;
   }
 
-  int16_t yawTurn = 0;
-  if (imu_ != nullptr && imu_->isOnline(nowMs)) {
-    float yawErr = ImuSerial::wrapAngleDeg(nominalHeadingDeg_ - imu_->yawDeg());
-    yawTurn = -static_cast<int16_t>(tp.kpYawHold * yawErr);
+  int16_t speed = tp.basePwm;
+  // 取消硬切 220mm 阶跃限速（消除启动后突然加速现象）；仅出库初段偏差明显过大时温和降速并走统一斜坡过渡
+  if (encoders_ != nullptr && leftValid) {
+    float movedMm = encoders_->avgDistanceMm() - exitStartDistMm_;
+    if (movedMm < static_cast<float>(EXIT_CALM_DIST_MM) && abs(err) >= 28) {
+      speed = min(speed, EXIT_CALM_PWM);
+    }
   }
+  if (front.valid && front.filteredMm < tp.frontSlowMm && tp.frontSlowMm > tp.frontStopMm) {
+    int32_t span = static_cast<int32_t>(tp.frontSlowMm - tp.frontStopMm);
+    int32_t rem = (front.filteredMm > tp.frontStopMm)
+                      ? static_cast<int32_t>(front.filteredMm - tp.frontStopMm)
+                      : 0;
+    int16_t decelSpd = static_cast<int16_t>(
+        tp.slowPwm + (static_cast<int32_t>(tp.basePwm - tp.slowPwm) * rem) / span);
+    speed = min(speed, decelSpd);
+  }
+  speed = rampSpeed(speed, nowMs);
 
-  int16_t cmdTurn = constrain(usTurn + yawTurn, -tp.maxSteerPwm, tp.maxSteerPwm);
-  motors_->setTank(speed, cmdTurn);
+  // 融合控制：外环超声误差 -> ±5° 串级柔和目标切入角 + 轻度麦轮微横移辅助（杜绝猛打方向撞墙）
+  const bool imuOnline = (imu_ != nullptr) && imu_->isOnline(nowMs);
+  if (imuOnline) {
+    float yawOff = 0.0f;
+    int16_t strafe = 0;
+    if (leftValid) {
+      yawOff = constrain(
+          CASCADE_KP_DEG_PER_MM * static_cast<float>(err) + CASCADE_KD_DEG_PER_MMS * wallFilteredDErr_,
+          -CASCADE_MAX_YAW_DEG,
+          CASCADE_MAX_YAW_DEG);
+      strafe = constrain(
+          -static_cast<int16_t>(DRIVE_STRAFE_KP * static_cast<float>(err)),
+          -DRIVE_STRAFE_MAX_PWM,
+          DRIVE_STRAFE_MAX_PWM);
+    }
+    float desiredYaw = ImuSerial::wrapAngleDeg(nominalHeadingDeg_ + yawOff);
+    float yawErr = ImuSerial::wrapAngleDeg(desiredYaw - imu_->yawDeg());
+    int16_t cmdTurn = constrain(
+        -static_cast<int16_t>(tp.kpYawHold * yawErr), -tp.maxSteerPwm, tp.maxSteerPwm);
+    motors_->setMecanum(speed, strafe, cmdTurn);
+  } else {
+    int16_t usTurn = 0;
+    if (leftValid) {
+      usTurn = -static_cast<int16_t>(tp.kp * static_cast<float>(err) + tp.kd * wallFilteredDErr_);
+      usTurn = constrain(usTurn, -tp.maxSteerPwm, tp.maxSteerPwm);
+    }
+    motors_->setTank(speed, usTurn);
+  }
   return false;
 }
 
@@ -680,23 +798,69 @@ bool MissionController::stepEnterStartZone(uint32_t nowMs) {
     return true;
   }
 
-  // 面向 -Y 驶出入口时，右侧仍能短暂看到左外围栏 (X=0)，贴 85mm 居中过门
-  int16_t usTurn = 0;
-  if (right.valid && right.filteredMm <= tp.sideWallMaxMm) {
-    int16_t err = static_cast<int16_t>(right.filteredMm) - static_cast<int16_t>(params_.crossOuterWallMm);
-    if (abs(err) > tp.errDeadbandMm) {
-      usTurn = static_cast<int16_t>(tp.kp * static_cast<float>(err));
+  // 面向 -Y 驶出入口时，右侧仍能短暂看到左外围栏 (X=0)，按独立 homeOuterWallMm 做串级柔和贴墙过门
+  bool rightValid = right.valid && (right.filteredMm <= tp.sideWallMaxMm);
+  int16_t err = 0;
+  if (rightValid) {
+    err = static_cast<int16_t>(right.filteredMm) - static_cast<int16_t>(params_.homeOuterWallMm);
+    if (abs(err) <= tp.errDeadbandMm) {
+      err = 0;
+    }
+    if (right.lastUpdateMs != wallLastUpdateMs_) {
+      if (wallPrevErrValid_ && wallLastUpdateMs_ != 0 && right.lastUpdateMs > wallLastUpdateMs_) {
+        float dtSec = static_cast<float>(right.lastUpdateMs - wallLastUpdateMs_) * 0.001f;
+        if (dtSec >= 0.02f && dtSec <= 0.50f) {
+          float rawD = static_cast<float>(err - wallPrevErrMm_) / dtSec;
+          wallFilteredDErr_ = 0.5f * rawD + 0.5f * wallFilteredDErr_;
+        }
+      } else {
+        wallFilteredDErr_ = 0.0f;
+      }
+      wallPrevErrMm_ = err;
+      wallPrevErrValid_ = true;
+      wallLastUpdateMs_ = right.lastUpdateMs;
+    }
+  } else {
+    wallPrevErrValid_ = false;
+    wallFilteredDErr_ = 0.0f;
+  }
+
+  // 入库末段 220mm 内线性减速并走平滑斜坡，入库停稳无急刹顿挫
+  int16_t homeSpd = params_.crossPwm;
+  if (encoders_ != nullptr) {
+    float remMm = static_cast<float>(params_.homeDistMm) - (encoders_->avgDistanceMm() - homeStartDistMm_);
+    if (remMm < 220.0f) {
+      int32_t r = max(0L, static_cast<int32_t>(remMm));
+      homeSpd = static_cast<int16_t>(
+          tp.slowPwm + (static_cast<int32_t>(max(params_.crossPwm, tp.slowPwm) - tp.slowPwm) * r) / 220L);
     }
   }
+  homeSpd = rampSpeed(homeSpd, nowMs);
 
-  int16_t yawTurn = 0;
   if (imu_ != nullptr && imu_->isOnline(nowMs)) {
-    float yawErr = ImuSerial::wrapAngleDeg(nominalHeadingDeg_ - imu_->yawDeg());
-    yawTurn = -static_cast<int16_t>(tp.kpYawHold * yawErr);
+    float yawOff = 0.0f;
+    if (rightValid) {
+      // err > 0 表示离右侧围栏太远，需顺时针向右贴回（yaw 减小）
+      yawOff = constrain(
+          -(CASCADE_KP_DEG_PER_MM * static_cast<float>(err) + CASCADE_KD_DEG_PER_MMS * wallFilteredDErr_),
+          -CASCADE_MAX_YAW_DEG,
+          CASCADE_MAX_YAW_DEG);
+    }
+    float desiredYaw = ImuSerial::wrapAngleDeg(nominalHeadingDeg_ + yawOff);
+    float yawErr = ImuSerial::wrapAngleDeg(desiredYaw - imu_->yawDeg());
+    int16_t cmdTurn = constrain(
+        -static_cast<int16_t>(tp.kpYawHold * yawErr), -tp.maxSteerPwm, tp.maxSteerPwm);
+    motors_->setTank(homeSpd, cmdTurn);
+  } else {
+    int16_t usTurn = 0;
+    if (rightValid) {
+      usTurn = constrain(
+          static_cast<int16_t>(tp.kp * static_cast<float>(err) + tp.kd * wallFilteredDErr_),
+          -tp.maxSteerPwm,
+          tp.maxSteerPwm);
+    }
+    motors_->setTank(homeSpd, usTurn);
   }
-
-  int16_t cmdTurn = constrain(usTurn + yawTurn, -tp.maxSteerPwm, tp.maxSteerPwm);
-  motors_->setTank(params_.crossPwm, cmdTurn);
   return false;
 }
 
@@ -812,24 +976,37 @@ bool MissionController::stepCrossRidge(uint32_t nowMs) {
   const auto& outer = sensors_->get(outerId);
   const auto& inner = sensors_->get(innerId);
 
-  // 1. 保持沿端头通道居中直行：外侧超声贴 85mm + IMU 航向锁直
-  int16_t usTurn = 0;
-  if (outer.valid && outer.filteredMm <= tracker_->params().sideWallMaxMm) {
+  // 1. 保持沿端头通道居中直行：串级 ±5° 外侧贴墙 (76mm) + 轻度麦轮微横移 + IMU 锁直
+  const auto& tp = tracker_->params();
+  bool outerValid = outer.valid && (outer.filteredMm <= tp.sideWallMaxMm);
+  int16_t lateralErr = 0;  // 统一约定：>0 车偏右需向左修正，<0 车偏左需向右修正
+  if (outerValid) {
     int16_t outerErr = static_cast<int16_t>(outer.filteredMm) - static_cast<int16_t>(params_.crossOuterWallMm);
-    if (abs(outerErr) > tracker_->params().errDeadbandMm) {
-      int16_t corr = static_cast<int16_t>(tracker_->params().kp * static_cast<float>(outerErr));
-      usTurn = currentTurnLeft_ ? corr : -corr;
+    if (abs(outerErr) > tp.errDeadbandMm) {
+      lateralErr = currentTurnLeft_ ? -outerErr : outerErr;
     }
   }
 
-  int16_t yawTurn = 0;
+  int16_t crossSpd = rampSpeed(params_.crossPwm, nowMs);
   if (imu_ != nullptr && imu_->isOnline(nowMs)) {
-    float yawErr = ImuSerial::wrapAngleDeg(nominalHeadingDeg_ - imu_->yawDeg());
-    yawTurn = -static_cast<int16_t>(tracker_->params().kpYawHold * yawErr);
+    float yawOff = constrain(
+        CASCADE_KP_DEG_PER_MM * static_cast<float>(lateralErr),
+        -CASCADE_MAX_YAW_DEG,
+        CASCADE_MAX_YAW_DEG);
+    float desiredYaw = ImuSerial::wrapAngleDeg(nominalHeadingDeg_ + yawOff);
+    float yawErr = ImuSerial::wrapAngleDeg(desiredYaw - imu_->yawDeg());
+    int16_t cmdTurn = constrain(
+        -static_cast<int16_t>(tp.kpYawHold * yawErr), -tp.maxSteerPwm, tp.maxSteerPwm);
+    int16_t strafe = constrain(
+        -static_cast<int16_t>(DRIVE_STRAFE_KP * static_cast<float>(lateralErr)),
+        -DRIVE_STRAFE_MAX_PWM,
+        DRIVE_STRAFE_MAX_PWM);
+    motors_->setMecanum(crossSpd, strafe, cmdTurn);
+  } else {
+    int16_t usTurn = constrain(
+        -static_cast<int16_t>(tp.kp * static_cast<float>(lateralErr)), -tp.maxSteerPwm, tp.maxSteerPwm);
+    motors_->setTank(crossSpd, usTurn);
   }
-
-  int16_t cmdTurn = constrain(usTurn + yawTurn, -tracker_->params().maxSteerPwm, tracker_->params().maxSteerPwm);
-  motors_->setTank(params_.crossPwm, cmdTurn);
 
   // 2. 内侧超声边沿状态机：SEEK_RIDGE(找垄) -> PASS_RIDGE(过垄) -> CENTER_ADVANCE(编码器走140mm对中)
   if (crossPhase_ == CROSS_CENTER_ADVANCE) {
@@ -876,13 +1053,20 @@ bool MissionController::stepCrossRidge(uint32_t nowMs) {
     }
   } else if (crossPhase_ == CROSS_PASS_RIDGE) {
     if (seesOpen) {
-      crossEdgeStreak_++;
+      // !inner.valid 在底层 UltrasonicArray 已连续 US_STALE_LIMIT(3) 帧确认开阔，不再重复等第 4 帧防抖
+      if (!inner.valid) {
+        crossEdgeStreak_ = params_.crossDebounceCnt;
+      } else {
+        crossEdgeStreak_++;
+      }
       if (crossEdgeStreak_ >= params_.crossDebounceCnt) {
         crossPhase_ = CROSS_CENTER_ADVANCE;
         crossEdgeStreak_ = 0;
         crossCenterStartMs_ = nowMs;
         crossCenterStartDistMm_ = (encoders_ != nullptr) ? encoders_->avgDistanceMm() : 0.0f;
-        Serial.println(F("[CROSS] 离开垄端面进入新沟口 -> 编码器微进 140mm 对中"));
+        Serial.print(F("[CROSS] 离开垄端面进入新沟口 -> 编码器微进 "));
+        Serial.print(params_.crossCenterMm);
+        Serial.println(F("mm 对中"));
       }
     } else {
       crossEdgeStreak_ = 0;
@@ -901,6 +1085,7 @@ const char* MissionController::stateName(MissionState s) {
     case MS_LTEST_TURN:           return "LT_TURN";
     case MS_LTEST_PAUSE2:         return "LT_P2";
     case MS_LTEST_LEG2:           return "LT_LEG2";
+    case MS_ALIGN_START:          return "ALIGN";
     case MS_EXIT_TO_TOP:          return "EXIT";
     case MS_SETTLE_BEFORE_ENTER:  return "PRE_EN";
     case MS_TURN_ENTER_FIRST:     return "TURN_EN";
@@ -913,6 +1098,7 @@ const char* MissionController::stateName(MissionState s) {
     case MS_SETTLE_BEFORE_TURN2:  return "PRE_T2";
     case MS_TURN_2:               return "TURN2";
     case MS_SETTLE_AFTER_TURN2:   return "POST_T2";
+    case MS_SETTLE_BEFORE_REVERSE: return "PRE_REV";
     case MS_RETURN_REVERSE:       return "RET_REV";
     case MS_SETTLE_BEFORE_HOME:   return "PRE_HM";
     case MS_TURN_HOME:            return "TURN_HM";
