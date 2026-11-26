@@ -1,3 +1,7 @@
+// ============================================================================
+// 【文件作用】全程 7 垄比赛与 U 形换垄任务状态机头文件（声明接口，平时调参不用改）
+//   - 定义出库、90° 转弯、扫垄跨沟、7 垄蛇形、倒车对口及回启动区的全部状态。
+// ============================================================================
 #pragma once
 
 #include <Arduino.h>
@@ -16,7 +20,8 @@ enum MissionState : uint8_t {
   MS_LTEST_TURN,           // L形测试 转向：IMU 闭环 90° 左/右转
   MS_LTEST_PAUSE2,         // L形测试 停顿稳车（准备第2段直行）
   MS_LTEST_LEG2,           // L形测试 第2段：按转向后新航向编码器定距直行
-  MS_EXIT_TO_TOP,          // 出启动区，沿左通道(+Y)贴左围栏直达顶围栏(Ch7 端头)
+  MS_ALIGN_START,          // 发车前原地麦轮微横移对中（锁死 0° 航向，先对齐左侧 76mm 再出库）
+  MS_EXIT_TO_TOP,          // 出启动区，沿左通道(+Y)串级限幅贴左围栏直达顶围栏(Ch7 端头)
   MS_SETTLE_BEFORE_ENTER,
   MS_TURN_ENTER_FIRST,     // 前向弧线右转 90° 进入 Ch7 (+X)
   MS_SETTLE_AFTER_ENTER,
@@ -28,6 +33,7 @@ enum MissionState : uint8_t {
   MS_SETTLE_BEFORE_TURN2,
   MS_TURN_2,               // 端头第二次前向弧线 90° 转向进入新沟
   MS_SETTLE_AFTER_TURN2,
+  MS_SETTLE_BEFORE_REVERSE,// 1 号沟端头停稳并清空超声滤波，再平稳启动倒车
   MS_RETURN_REVERSE,       // 完成最后一条沟(Ch1)后，沿 Ch1 倒车(-X)靠后超声贴左围栏对准入口
   MS_SETTLE_BEFORE_HOME,
   MS_TURN_HOME,            // 后退偏置弧线右转 90° 面向入口(-Y)
@@ -52,7 +58,9 @@ struct MissionParams {
   uint16_t turnTimeoutMs     = DEFAULT_TURN_TIMEOUT_MS;
 
   int16_t crossPwm           = DEFAULT_CROSS_PWM;
+  uint16_t exitOuterWallMm   = DEFAULT_EXIT_OUTER_WALL_MM;
   uint16_t crossOuterWallMm  = DEFAULT_CROSS_OUTER_WALL_MM;
+  uint16_t homeOuterWallMm   = DEFAULT_HOME_OUTER_WALL_MM;
   uint16_t crossRidgeMaxMm   = DEFAULT_CROSS_RIDGE_MAX_MM;
   uint16_t crossOpenMinMm    = DEFAULT_CROSS_OPEN_MIN_MM;
   uint8_t crossDebounceCnt   = DEFAULT_CROSS_DEBOUNCE_CNT;
@@ -122,8 +130,10 @@ class MissionController {
   };
 
   void enterState(MissionState next, uint32_t nowMs);
+  int16_t rampSpeed(int16_t targetPwm, uint32_t nowMs);
   void startTurnStep(MissionState turnState, float targetYawDeg, bool turnLeft, int8_t arcSign, uint32_t nowMs);
   bool stepDriveDist(uint32_t nowMs);
+  bool stepAlignStart(uint32_t nowMs);
   bool stepTurn(uint32_t nowMs);
   bool stepExitToTop(uint32_t nowMs);
   bool stepCrossRidge(uint32_t nowMs);
@@ -160,6 +170,8 @@ class MissionController {
   uint32_t turnInTolSinceMs_ = 0;
 
   // 跨垄与回库子状态
+  uint32_t alignInTolSinceMs_ = 0;
+  float exitStartDistMm_ = 0.0f;
   CrossPhase crossPhase_ = CROSS_SEEK_RIDGE;
   uint8_t crossEdgeStreak_ = 0;
   uint32_t crossLastInnerMs_ = 0;
@@ -175,4 +187,8 @@ class MissionController {
   int16_t wallPrevErrMm_ = 0;
   uint32_t wallLastUpdateMs_ = 0;
   float wallFilteredDErr_ = 0.0f;
+
+  // 平滑加减速斜率限制状态（消除出库/跨垄/入库的突兀加速与顿挫）
+  float smoothSpeedPwm_ = 0.0f;
+  uint32_t lastSpeedRampMs_ = 0;
 };

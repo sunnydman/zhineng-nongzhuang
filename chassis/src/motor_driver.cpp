@@ -1,3 +1,8 @@
+// ============================================================================
+// 【文件作用】四路直流电机驱动与四轮速度 PI 闭环实现
+//   - 负责把速度指令输出到两块 L298N（含换向死区保护、电磁刹车、麦轮全向解算），
+//     并按 20 Hz 执行四轮独立速度 PI 闭环（自动拉齐轮速与抗毛毯阻力、防飞车保护）。
+// ============================================================================
 #include "motor_driver.h"
 
 #include "encoder_array.h"
@@ -91,6 +96,11 @@ void MotorDriver::setWheel(WheelId wheel, int16_t pwm) {
   }
 
   pwm = constrain(pwm, -MOTOR_PWM_MAX, MOTOR_PWM_MAX);
+  // 指令跨零换向（正<->负）时必须清零速度环积分，防止正向残留积分抵消反向纠偏导致越冲越远
+  if ((cmdPwm_[wheel] > 0 && pwm < 0) || (cmdPwm_[wheel] < 0 && pwm > 0)) {
+    velInteg_[wheel] = 0.0f;
+    faultSinceMs_[wheel] = 0;
+  }
   cmdPwm_[wheel] = pwm;
 
   if (pwm == 0) {
@@ -195,6 +205,28 @@ void MotorDriver::setTank(int16_t forwardPwm, int16_t turnPwm) {
   int16_t leftPwm = constrain(forwardPwm + turnPwm, -MOTOR_PWM_MAX, MOTOR_PWM_MAX);
   int16_t rightPwm = constrain(forwardPwm - turnPwm, -MOTOR_PWM_MAX, MOTOR_PWM_MAX);
   setLeftRight(leftPwm, rightPwm);
+}
+
+void MotorDriver::setMecanum(int16_t forwardPwm, int16_t strafePwm, int16_t turnPwm) {
+  int16_t s = MECANUM_STRAFE_INVERT ? -strafePwm : strafePwm;
+  int32_t fl = static_cast<int32_t>(forwardPwm) + s + turnPwm;
+  int32_t rl = static_cast<int32_t>(forwardPwm) - s + turnPwm;
+  int32_t fr = static_cast<int32_t>(forwardPwm) - s - turnPwm;
+  int32_t rr = static_cast<int32_t>(forwardPwm) + s - turnPwm;
+
+  // 若任一轮超出满幅，等比例缩放四轮以保持平移/转向合力方向不畸变
+  int32_t peak = max(max(abs(fl), abs(rl)), max(abs(fr), abs(rr)));
+  if (peak > MOTOR_PWM_MAX) {
+    fl = (fl * MOTOR_PWM_MAX) / peak;
+    rl = (rl * MOTOR_PWM_MAX) / peak;
+    fr = (fr * MOTOR_PWM_MAX) / peak;
+    rr = (rr * MOTOR_PWM_MAX) / peak;
+  }
+
+  setWheel(WHEEL_FL, static_cast<int16_t>(fl));
+  setWheel(WHEEL_RL, static_cast<int16_t>(rl));
+  setWheel(WHEEL_FR, static_cast<int16_t>(fr));
+  setWheel(WHEEL_RR, static_cast<int16_t>(rr));
 }
 
 void MotorDriver::stopAll() {

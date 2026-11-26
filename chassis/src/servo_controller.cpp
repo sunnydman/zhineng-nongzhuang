@@ -1,3 +1,8 @@
+// ============================================================================
+// 【文件作用】四路击打舵机控制器实现（LD=D32, RD=D33, LU=D34, RU=D35，Timer5）
+//   - 负责四根疏果击打杆的错峰竖直收回 (HOME)、外扩击打 (OUT/HIT) 与自动收回；
+//   - 如需微调各路竖直收回角或外扩击打角度，直接改 include/config.h 即可。
+// ============================================================================
 #include "servo_controller.h"
 
 #include <string.h>
@@ -296,7 +301,7 @@ uint8_t ServoController::currentAngle(uint8_t idx) const {
 }
 
 void ServoController::printStatus() const {
-  Serial.println(F("  Servos (Timer5, 竖直收回->外扩 90 deg):"));
+  Serial.println(F("  Servos (Timer5, 竖直收回->外扩 135~140 deg):"));
   for (uint8_t i = 0; i < SERVO_COUNT; ++i) {
     Serial.print(F("    "));
     Serial.print(kNames[i]);

@@ -1,4 +1,8 @@
 // ============================================================================
+// 【文件作用】主程序入口（setup 初始化 + loop 总调度 + 串口调试命令行）
+//   - 平时调参不用改这里，直接改 include/config.h；
+//   - 负责上电倒计时自启、D2 实体急停/启动键、三路串口调度及电脑调试命令处理。
+// ============================================================================
 // 主程序入口（Arduino Mega 2560 + Pro Max V3.3 扩展板）
 // 职责：
 //   1. 按固定优先级调度各子系统：串口急停/指令 -> 按键检测 -> IMU解析 -> 超声轮询
@@ -127,6 +131,7 @@ void printHelp() {
   Serial.println(F("  RATE <10..100>       : Set IMU output frequency Hz (0x60)"));
   Serial.println(F("  BAUD <rate>          : Switch Serial1 baud rate online (e.g. 115200 or 9600)"));
   Serial.println(F("  W <target> <pwm> [ms]: Bench test motor (target: fl|rl|fr|rr|l|r|all)"));
+  Serial.println(F("  ST <pwm> [ms]        : Test mecanum strafe (+pwm=RIGHT, -pwm=LEFT, default 600ms)"));
   Serial.println(F("  SV [zero|off|test|ld|rd|lu|ru|32..35] [deg]: 4-servo zero(90), dir test & control"));
   Serial.println(F("  MV / MVRAW / MVLOG   : Check OpenMV (Serial2/3) status / sniff raw bytes / toggle live log"));
   Serial.println(F("  SCALE <wheel> <val>  : Trim single wheel PWM scale (fl|rl|fr|rr, 0.50..1.30)"));
@@ -134,7 +139,7 @@ void printHelp() {
   Serial.println(F("  P                    : Print pinout, IMU status & parameters"));
   Serial.println(F("  SET <key> <val>      : Tune params online:"));
   Serial.println(F("                         kp kd ykp spd slow stop rstop wall side steer"));
-  Serial.println(F("                         tpwm tmin tkp arc tms cpwm cout cridge copen cmm cmax hdist"));
+  Serial.println(F("                         tpwm tmin tkp arc tms cpwm eout cout hout cridge copen cmm cmax hdist"));
   Serial.println(F("                         vpid(0|1) vkp vki vmax"));
   Serial.println(F("  SAVE / LOAD / RESETCFG: Save/reload/reset tuned params in EEPROM"));
   Serial.println(F("  H / ?                : Show this help\n"));
@@ -213,7 +218,7 @@ void printConfigSummary() {
   Serial.print(F("mm side=")); Serial.print(p.singleWallMm);
   Serial.println(F("mm"));
 
-  Serial.println(F("--- Turn & Lane-Change Params (L=320 W=310 recess=40mm) ---"));
+  Serial.println(F("--- Turn & Lane-Change Params (L=290 W=290 recess=20mm) ---"));
   Serial.print(F("  tpwm=")); Serial.print(mp.turnMaxPwm);
   Serial.print(F(" tmin=")); Serial.print(mp.turnMinPwm);
   Serial.print(F(" tkp=")); Serial.print(mp.turnKp, 2);
@@ -221,7 +226,9 @@ void printConfigSummary() {
   Serial.print(F(" tms=")); Serial.println(mp.turnFallback90Ms);
 
   Serial.print(F("  cpwm=")); Serial.print(mp.crossPwm);
-  Serial.print(F(" cout=")); Serial.print(mp.crossOuterWallMm);
+  Serial.print(F(" eout=")); Serial.print(mp.exitOuterWallMm);
+  Serial.print(F("mm cout=")); Serial.print(mp.crossOuterWallMm);
+  Serial.print(F("mm hout=")); Serial.print(mp.homeOuterWallMm);
   Serial.print(F("mm cridge=")); Serial.print(mp.crossRidgeMaxMm);
   Serial.print(F("mm copen=")); Serial.print(mp.crossOpenMinMm);
   Serial.print(F("mm cmm=")); Serial.print(mp.crossCenterMm);
@@ -426,8 +433,12 @@ void handleSetParam(char* key, char* valStr) {
     mp.turnFallback90Ms = static_cast<uint16_t>(constrain(atoi(valStr), 100, 3000));
   } else if (strcmp(key, "cpwm") == 0) {
     mp.crossPwm = constrain(atoi(valStr), 0, MOTOR_PWM_MAX);
+  } else if (strcmp(key, "eout") == 0) {
+    mp.exitOuterWallMm = static_cast<uint16_t>(max(40, atoi(valStr)));
   } else if (strcmp(key, "cout") == 0) {
     mp.crossOuterWallMm = static_cast<uint16_t>(max(40, atoi(valStr)));
+  } else if (strcmp(key, "hout") == 0) {
+    mp.homeOuterWallMm = static_cast<uint16_t>(max(40, atoi(valStr)));
   } else if (strcmp(key, "cridge") == 0) {
     mp.crossRidgeMaxMm = static_cast<uint16_t>(max(100, atoi(valStr)));
   } else if (strcmp(key, "copen") == 0) {
@@ -657,11 +668,26 @@ void processCommandLine(char* line) {
     char* t2 = strtok(nullptr, " \t");
     char* t3 = strtok(nullptr, " \t");
     handleWheelTest(t1, t2, t3);
+  } else if (strcmp(tok0, "st") == 0) {
+    char* t1 = strtok(nullptr, " \t");
+    char* t2 = strtok(nullptr, " \t");
+    if (t1 == nullptr) {
+      Serial.println(F("[ERR] Usage: ST <pwm> [ms] (+pwm=RIGHT, -pwm=LEFT, e.g. ST 85 600)"));
+      return;
+    }
+    int16_t pwm = static_cast<int16_t>(constrain(atoi(t1), -MOTOR_PWM_MAX, MOTOR_PWM_MAX));
+    uint32_t durMs = (t2 != nullptr) ? static_cast<uint32_t>(constrain(atol(t2), 100, 4000)) : 600UL;
+    cancelAll();
+    gMotors.setMecanum(0, pwm, 0);
+    gTracker.startManualTest(nowMs, durMs);
+    Serial.print(F("[STRAFE] pwm=")); Serial.print(pwm);
+    Serial.print(F(" (")); Serial.print((pwm >= 0) ? F("RIGHT") : F("LEFT"));
+    Serial.print(F(") dur=")); Serial.print(durMs); Serial.println(F(" ms"));
   } else if (strcmp(tok0, "sv") == 0) {
     // 四路击打舵机控制（LD=32左低, RD=33右低, LU=34左高, RU=35右高）：
     //   SV HOME / SV IN           -> 四路错峰全部贴身收回 (LD=30, RD=150, LU=150, RU=30)
-    //   SV OUT <ld|rd|lu|ru|all>  -> 按标定方向外扩 110° 至击打位
-    //   SV HIT <ld|rd|lu|ru>      -> 单路快速外扩 110° 击打并自动收回
+    //   SV OUT <ld|rd|lu|ru|all>  -> 按标定方向外扩 120° 至击打位
+    //   SV HIT <ld|rd|lu|ru>      -> 单路快速外扩 120° 击打并自动收回
     //   SV ZERO                   -> 四路错峰全归 90° 中位
     //   SV OFF                    -> 断力释放全部 4 路 PWM
     //   SV <ld|rd|lu|ru|32..35> <0..180> -> 转到指定角度

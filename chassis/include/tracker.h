@@ -1,3 +1,7 @@
+// ============================================================================
+// 【文件作用】垄沟居中循迹控制器头文件（声明接口，平时调参不用改）
+//   - 负责在 400mm 垄沟内双超声居中 / 单壁贴墙 + 陀螺仪锁直与端头减速停车。
+// ============================================================================
 #pragma once
 
 #include <Arduino.h>
@@ -55,6 +59,7 @@ class CorridorTracker {
   void startForwardWithHeading(float targetYawDeg);
   void startReverse(uint32_t nowMs);
   void startReverseWithHeading(float targetYawDeg);
+  void setSingleWallOverrideMm(uint16_t mm) { singleWallOverrideMm_ = mm; }
   void startManualTest(uint32_t nowMs, uint32_t durationMs);
 
   void update(uint32_t nowMs);
@@ -70,6 +75,7 @@ class CorridorTracker {
 
  private:
   void resetController();
+  int16_t rampSpeed(int16_t targetPwm, uint32_t nowMs);
   void runTracking(uint32_t nowMs, bool forward);
 
   MotorDriver* motors_ = nullptr;
@@ -90,4 +96,7 @@ class CorridorTracker {
   uint8_t endStopStreak_ = 0;
   uint32_t lastLeadUpdateMs_ = 0;
   uint32_t testDeadlineMs_ = 0;
+  float smoothSpeedPwm_ = 0.0f;
+  uint32_t lastSpeedRampMs_ = 0;
+  uint16_t singleWallOverrideMm_ = 0;
 };
